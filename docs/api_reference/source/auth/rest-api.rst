@@ -653,6 +653,24 @@ Request Structure
 +------------------+-------------+---------------------------+
 | permission       | ``STRING``  | Permission to add.        |
 +------------------+-------------+---------------------------+
+| condition        | ``OBJECT``  | Optional. Narrows a       |
+|                  |             | ``registered_model``      |
+|                  |             | permission to where the   |
+|                  |             | condition holds. One of   |
+|                  |             | ``{"type": "tag_equals",  |
+|                  |             | "key": ..., "value":      |
+|                  |             | ...}``, ``{"type":        |
+|                  |             | "tag_not_equals", "key":  |
+|                  |             | ..., "value": ...}``, or  |
+|                  |             | ``{"type":                |
+|                  |             | "alias_matches",          |
+|                  |             | "aliases": [...]}``       |
+|                  |             | (alias names or globs     |
+|                  |             | such as ``production-*``).|
+|                  |             | Other types or shapes,    |
+|                  |             | and other resource types, |
+|                  |             | are rejected.             |
++------------------+-------------+---------------------------+
 
 .. _mlflowAddRolePermissionResponse:
 
@@ -665,8 +683,10 @@ Response Structure
 | role_permission| ``OBJECT``               | The created permission, |
 |                |                          | containing id, role_id, |
 |                |                          | resource_type,          |
-|                |                          | resource_pattern, and   |
-|                |                          | permission.             |
+|                |                          | resource_pattern,       |
+|                |                          | permission, and         |
+|                |                          | condition (``null`` if  |
+|                |                          | unconditional).         |
 +----------------+--------------------------+-------------------------+
 
 ===========================
@@ -754,6 +774,16 @@ Request Structure
 +---------------------+-------------+---------------------+
 | permission          | ``STRING``  | New permission.     |
 +---------------------+-------------+---------------------+
+| condition           | ``OBJECT``  | Optional. Omit to   |
+|                     |             | keep the stored     |
+|                     |             | condition, pass a   |
+|                     |             | condition object    |
+|                     |             | (see Add Role       |
+|                     |             | Permission) to      |
+|                     |             | replace it, or      |
+|                     |             | ``null`` to clear   |
+|                     |             | it.                 |
++---------------------+-------------+---------------------+
 
 .. _mlflowUpdateRolePermissionResponse:
 
@@ -766,8 +796,10 @@ Response Structure
 | role_permission | ``OBJECT`` | The updated permission, |
 |                 |            | containing id, role_id, |
 |                 |            | resource_type,          |
-|                 |            | resource_pattern, and   |
-|                 |            | permission.             |
+|                 |            | resource_pattern,       |
+|                 |            | permission, and         |
+|                 |            | condition (``null`` if  |
+|                 |            | unconditional).         |
 +-----------------+------------+-------------------------+
 
 ===========================

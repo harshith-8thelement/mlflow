@@ -16,6 +16,11 @@ from mlflow.protos.databricks_pb2 import (
     RESOURCE_ALREADY_EXISTS,
     RESOURCE_DOES_NOT_EXIST,
 )
+from mlflow.server.auth.conditions import (
+    UNSET,
+    serialize_condition,
+    validate_condition,
+)
 from mlflow.server.auth.db import utils as dbutils
 from mlflow.server.auth.db.models import (
     SqlRole,
@@ -122,6 +127,8 @@ class RoleGrantRow(NamedTuple):
     resource_type: str
     resource_pattern: str
     permission: str
+    # Raw canonical JSON of the grant's condition; None for an unconditional grant.
+    condition: str | None = None
 
 
 class NamedRoleGrant(NamedTuple):
@@ -2077,12 +2084,14 @@ class SqlAlchemyStore:
         resource_type: str,
         resource_pattern: str,
         permission: str,
+        condition: dict | None = None,
     ) -> RolePermission:
         _validate_permission_for_resource_type(permission, resource_type)
         if resource_type == RESOURCE_TYPE_EXPERIMENT and resource_pattern != "*":
             resource_pattern = str(_parse_experiment_id(str(resource_pattern)))
         resource_pattern = self._validate_resource_pattern(resource_type, resource_pattern)
         _validate_resource_pattern(resource_pattern, resource_type)
+        condition_json = serialize_condition(validate_condition(condition, resource_type))
         with self.ManagedSessionMaker(read_only=False) as session:
             self._get_role(session, role_id)
             try:
@@ -2091,6 +2100,7 @@ class SqlAlchemyStore:
                     resource_type=resource_type,
                     resource_pattern=resource_pattern,
                     permission=permission,
+                    condition_json=condition_json,
                 )
                 session.add(rp)
                 session.flush()
@@ -2098,7 +2108,8 @@ class SqlAlchemyStore:
             except IntegrityError as e:
                 raise MlflowException(
                     f"Role permission (role_id={role_id}, resource_type={resource_type}, "
-                    f"resource_pattern={resource_pattern}) already exists.",
+                    f"resource_pattern={resource_pattern}) already exists. A role holds one "
+                    "permission per (resource_type, resource_pattern), whatever its condition.",
                     RESOURCE_ALREADY_EXISTS,
                 ) from e
 
@@ -2139,10 +2150,16 @@ class SqlAlchemyStore:
             )
             return [p.to_mlflow_entity() for p in perms]
 
-    def update_role_permission(self, role_permission_id: int, permission: str) -> RolePermission:
+    def update_role_permission(
+        self, role_permission_id: int, permission: str, condition=UNSET
+    ) -> RolePermission:
         with self.ManagedSessionMaker(read_only=False) as session:
             rp = self._get_role_permission(session, role_permission_id)
             _validate_permission_for_resource_type(permission, rp.resource_type)
+            if condition is not UNSET:
+                rp.condition_json = serialize_condition(
+                    validate_condition(condition, rp.resource_type)
+                )
             rp.permission = permission
             return rp.to_mlflow_entity()
 
@@ -2304,6 +2321,11 @@ class SqlAlchemyStore:
                     if rp.resource_type != resource_type:
                         continue
                     if matches(rp.resource_pattern, resource_type, resource_id):
+                        # This helper has no request context to evaluate a condition in:
+                        # a conditional DENY is treated as unconditional, and any other
+                        # conditional grant is skipped (fail-closed).
+                        if rp.condition_json is not None and rp.permission != DENY.name:
+                            continue
                         # DENY is below every positive level, so folding it with
                         # ``max_permission`` would silently lift it to the positive grant
                         # beside it. Track it separately, as ``fold_grants_for_key`` does.
@@ -2397,6 +2419,7 @@ class SqlAlchemyStore:
                     SqlRolePermission.resource_type,
                     SqlRolePermission.resource_pattern,
                     SqlRolePermission.permission,
+                    SqlRolePermission.condition_json,
                 )
                 .join(SqlRole, SqlRole.id == SqlRolePermission.role_id)
                 .join(SqlUserRoleAssignment, SqlRole.id == SqlUserRoleAssignment.role_id)
@@ -2407,7 +2430,10 @@ class SqlAlchemyStore:
                 )
                 .all()
             )
-            return [RoleGrantRow(rtype, pattern, permission) for rtype, pattern, permission in rows]
+            return [
+                RoleGrantRow(rtype, pattern, permission, condition)
+                for rtype, pattern, permission, condition in rows
+            ]
 
     def list_role_grants_for_user_in_workspace(
         self, user_id: int, workspace: str, resource_type: str

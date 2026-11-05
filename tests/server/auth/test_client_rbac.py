@@ -11,6 +11,7 @@ from mlflow.environment_variables import (
     MLFLOW_TRACKING_USERNAME,
 )
 from mlflow.protos.databricks_pb2 import (
+    INVALID_PARAMETER_VALUE,
     PERMISSION_DENIED,
     RESOURCE_ALREADY_EXISTS,
     RESOURCE_DOES_NOT_EXIST,
@@ -182,6 +183,60 @@ def test_role_permission_crud(client, monkeypatch):
 
         client.remove_role_permission(rp.id)
         assert client.list_role_permissions(role.id) == []
+
+
+def test_role_permission_condition_round_trip(client, monkeypatch):
+    tag_condition = {"type": "tag_not_equals", "key": "promoted", "value": "true"}
+    alias_condition = {"type": "alias_matches", "aliases": ["staging", "production-*"]}
+    with User(ADMIN_USERNAME, ADMIN_PASSWORD, monkeypatch):
+        role = client.create_role(workspace="ws1", name="editor")
+        plain = client.add_role_permission(role.id, "registered_model", "plain", "READ")
+        assert plain.condition is None
+
+        rp = client.add_role_permission(
+            role.id, "registered_model", "*", "EDIT", condition=tag_condition
+        )
+        assert rp.condition == tag_condition
+        by_pattern = {p.resource_pattern: p for p in client.list_role_permissions(role.id)}
+        assert by_pattern["*"].condition == tag_condition
+        assert by_pattern["plain"].condition is None
+
+        # Omitting the condition keeps it; a dict replaces it; None clears it.
+        assert client.update_role_permission(rp.id, "READ").condition == tag_condition
+        replaced = client.update_role_permission(rp.id, "EDIT", condition=alias_condition)
+        assert replaced.permission == "EDIT"
+        assert replaced.condition == alias_condition
+        assert client.update_role_permission(rp.id, "EDIT", condition=None).condition is None
+        assert {p.id: p.condition for p in client.list_role_permissions(role.id)}[rp.id] is None
+
+
+@pytest.mark.parametrize(
+    ("resource_type", "condition", "match"),
+    [
+        ("registered_model", {"type": "bogus"}, "Unknown condition type"),
+        ("registered_model", {"type": "tag_equals", "key": "k"}, "missing"),
+        ("registered_model", {"type": "alias_matches", "aliases": []}, "non-empty list"),
+        ("experiment", {"type": "tag_equals", "key": "k", "value": "v"}, "only supported"),
+    ],
+)
+def test_add_role_permission_rejects_invalid_condition(
+    client, monkeypatch, resource_type, condition, match
+):
+    with User(ADMIN_USERNAME, ADMIN_PASSWORD, monkeypatch):
+        role = client.create_role(workspace="ws1", name="editor")
+        with pytest.raises(MlflowException, match=match) as exc:
+            client.add_role_permission(role.id, resource_type, "*", "EDIT", condition=condition)
+        assert exc.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
+        assert client.list_role_permissions(role.id) == []
+
+
+def test_update_role_permission_rejects_invalid_condition(client, monkeypatch):
+    with User(ADMIN_USERNAME, ADMIN_PASSWORD, monkeypatch):
+        role = client.create_role(workspace="ws1", name="editor")
+        rp = client.add_role_permission(role.id, "registered_model", "*", "EDIT")
+        with pytest.raises(MlflowException, match="Unknown condition type"):
+            client.update_role_permission(rp.id, "EDIT", condition={"type": "bogus"})
+        assert client.list_role_permissions(role.id)[0].condition is None
 
 
 def test_add_role_permission_invalid_resource_type(client, monkeypatch):

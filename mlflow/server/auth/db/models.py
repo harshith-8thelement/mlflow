@@ -5,10 +5,12 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import declarative_base, relationship
 
+from mlflow.server.auth.conditions import deserialize_condition
 from mlflow.server.auth.entities import (
     Role,
     RolePermission,
@@ -82,6 +84,7 @@ class SqlRolePermission(Base):
     resource_type = Column(String(64), nullable=False)
     resource_pattern = Column(String(255), nullable=False)
     permission = Column(String(255), nullable=False)
+    condition_json = Column(Text, nullable=True)
     __table_args__ = (
         UniqueConstraint(
             "role_id", "resource_type", "resource_pattern", name="unique_role_resource_perm"
@@ -96,6 +99,7 @@ class SqlRolePermission(Base):
             resource_type=self.resource_type,
             resource_pattern=self.resource_pattern,
             permission=self.permission,
+            condition=deserialize_condition(self.condition_json),
         )
 
 

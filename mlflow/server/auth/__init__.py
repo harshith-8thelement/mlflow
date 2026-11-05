@@ -23,7 +23,7 @@ import re
 import secrets
 import threading
 import urllib.parse
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from http import HTTPStatus
 from typing import Any, Awaitable, Callable, Literal
@@ -284,6 +284,7 @@ from mlflow.server._request_keys import (
     SCOPED_MCP_SERVER_FILTER,
 )
 from mlflow.server.asgi_utils import get_routed_asgi_path
+from mlflow.server.auth.conditions import UNSET, ConditionContext
 from mlflow.server.auth.config import DEFAULT_AUTHORIZATION_FUNCTION, read_auth_config
 from mlflow.server.auth.entities import GetUserPermissionResult, User
 from mlflow.server.auth.logo import MLFLOW_LOGO
@@ -331,6 +332,7 @@ from mlflow.server.auth.requirements import (
     ACTION_NOT_DENIED,
     Requirement,
     action_met,
+    applicable_grants,
     floor_positive_permission,
     fold_grants_for_key,
     governing_permission_and_action,
@@ -910,20 +912,31 @@ def _absent_permission(workspace_name: str) -> Permission:
 
 
 def resolve_permissions(
-    username: str, workspace_name: str, keys: "Sequence[GrantLoadKey]"
+    username: str,
+    workspace_name: str,
+    keys: "Sequence[GrantLoadKey]",
+    context: ConditionContext | None = None,
 ) -> "list[Permission | None]":
-    """The permission at each key, from ONE store query. ``None`` means no grant there."""
+    """The permission at each key, from ONE store query. ``None`` means no grant there.
+
+    ``context`` describes the request for grants carrying a condition; without one, such a
+    grant fails closed (a DENY applies, a positive grant does not).
+    """
     grants = store.list_grants(
         store.get_user(username).id, workspace_name, {key.resource_type for key in keys}
     )
     if any(is_workspace_admin_grant(grant) for grant in grants):
         # Admins are not restrictable, so this precedes every other rule including DENY.
         return [MANAGE] * len(keys)
-    return [fold_grants_for_key(grants, key) for key in keys]
+    applicable = applicable_grants(grants, context)
+    return [fold_grants_for_key(applicable, key) for key in keys]
 
 
 def _resolve_requirement_decisions(
-    username: str, anchor: "tuple[str, str]", requirements: "Sequence[Requirement]"
+    username: str,
+    anchor: "tuple[str, str]",
+    requirements: "Sequence[Requirement]",
+    context: ConditionContext | None = None,
 ) -> "list[tuple[Permission, str]] | None":
     """
     The governing permission AND the action it must satisfy, per requirement, from one grants
@@ -936,7 +949,7 @@ def _resolve_requirement_decisions(
     if workspace_name is None:
         return None
     keys = requirements_to_grant_load_keys(requirements)
-    permissions = dict(zip(keys, resolve_permissions(username, workspace_name, keys)))
+    permissions = dict(zip(keys, resolve_permissions(username, workspace_name, keys, context)))
     absent = _absent_permission(workspace_name)
     return [
         governing_permission_and_action(
@@ -947,23 +960,29 @@ def _resolve_requirement_decisions(
 
 
 def resolve_requirements(
-    username: str, anchor: "tuple[str, str]", requirements: "Sequence[Requirement]"
+    username: str,
+    anchor: "tuple[str, str]",
+    requirements: "Sequence[Requirement]",
+    context: ConditionContext | None = None,
 ) -> "list[Permission] | None":
     """
     The permission that governs each requirement, from one grants query in the anchor's
     workspace. ``None`` when the anchor workspace cannot be resolved (callers deny).
     """
-    decisions = _resolve_requirement_decisions(username, anchor, requirements)
+    decisions = _resolve_requirement_decisions(username, anchor, requirements, context)
     if decisions is None:
         return None
     return [permission for permission, _action in decisions]
 
 
 def authorize(
-    username: str, anchor: "tuple[str, str]", requirements: "Sequence[Requirement]"
+    username: str,
+    anchor: "tuple[str, str]",
+    requirements: "Sequence[Requirement]",
+    context: ConditionContext | None = None,
 ) -> bool:
     """Allow only if EVERY requirement is met by the permission that governs it."""
-    decisions = _resolve_requirement_decisions(username, anchor, requirements)
+    decisions = _resolve_requirement_decisions(username, anchor, requirements, context)
     if decisions is None:
         return False
     return all(action_met(action, permission) for permission, action in decisions)
@@ -976,6 +995,10 @@ class RetentionGate:
     template's own id, which is the whole answer for a wildcard-only tier; ``retains(type, id)``
     substitutes a per-row id. Decisions and folds memoize, so a listing that repeats a resource
     resolves it once.
+
+    Grants carrying a condition cannot be folded ahead of time, since whether they apply depends
+    on the row being asked about. They are kept aside per type and combined with the unconditional
+    fold on each ``retains`` call; a decision or fold touching such a type is never memoized.
 
     Asking about a type no template covered raises: its grants were never loaded, so any answer
     would be a guess, and a mistyped type silently redacting a response is worse than a loud
@@ -992,18 +1015,33 @@ class RetentionGate:
     ) -> None:
         self._templates = templates
         grants_by_key = {}
+        conditional_by_key: dict[GrantLoadKey, list[Any]] = {}
         for grant in grants:
             key = GrantLoadKey(grant.resource_type, grant.resource_pattern)
-            grants_by_key.setdefault(key, []).append(grant)
+            if getattr(grant, "condition", None) is None:
+                grants_by_key.setdefault(key, []).append(grant)
+            else:
+                conditional_by_key.setdefault(key, []).append(grant)
         # Fold each pattern once; candidate lookups combine only its exact and wildcard grants.
         self._grants = {key: fold_grants_for_key(rows, key) for key, rows in grants_by_key.items()}
+        self._conditional = conditional_by_key
+        self._conditional_types = frozenset(key.resource_type for key in conditional_by_key)
         self._default_permission = default_permission
         self._absent = absent
         self._always = always
         self._decided: dict[tuple[str, str], bool] = {}
         self._folded: dict[GrantLoadKey, Permission | None] = {}
 
-    def retains(self, resource_type: str, resource_id: "str | None" = None) -> bool:
+    def has_conditional_grants(self, resource_type: str) -> bool:
+        """Whether a decision on ``resource_type`` can depend on the row's attributes."""
+        return self._always is None and resource_type in self._conditional_types
+
+    def retains(
+        self,
+        resource_type: str,
+        resource_id: "str | None" = None,
+        context: ConditionContext | None = None,
+    ) -> bool:
         template = self._templates.get(resource_type)
         if template is None:
             raise KeyError(
@@ -1015,35 +1053,57 @@ class RetentionGate:
         requirement = (
             template if resource_id is None else template._replace(resource_id=resource_id)
         )
+        load_keys = requirement_to_grant_load_keys(requirement)
+        # A decision that rests on a conditional type is only valid for this context.
+        memoize = not any(key.resource_type in self._conditional_types for key in load_keys)
         cache_key = (requirement.resource_type, requirement.resource_id)
-        decided = self._decided.get(cache_key)
+        decided = self._decided.get(cache_key) if memoize else None
         if decided is None:
-            permissions = {
-                key: self._fold(key) for key in requirement_to_grant_load_keys(requirement)
-            }
+            permissions = {key: self._fold(key, context) for key in load_keys}
             decided = requirement_satisfied(
                 requirement, permissions, self._default_permission, self._absent
             )
-            self._decided[cache_key] = decided
+            if memoize:
+                self._decided[cache_key] = decided
         return decided
 
-    def _fold(self, key: GrantLoadKey) -> "Permission | None":
+    @staticmethod
+    def _combine(first: "Permission | None", second: "Permission | None") -> "Permission | None":
+        if first is None:
+            return second
+        if second is None:
+            return first
+        if first.denied or second.denied:
+            return DENY
+        return get_permission(max_permission(first.name, second.name))
+
+    def _pattern_permission(
+        self, key: GrantLoadKey, context: ConditionContext | None
+    ) -> "Permission | None":
+        permission = self._grants.get(key)
+        conditional = self._conditional.get(key)
+        if conditional:
+            permission = self._combine(
+                permission, fold_grants_for_key(applicable_grants(conditional, context), key)
+            )
+        return permission
+
+    def _fold(
+        self, key: GrantLoadKey, context: ConditionContext | None = None
+    ) -> "Permission | None":
         key = GrantLoadKey(
             key.resource_type, canonical_resource_id(key.resource_type, key.resource_id)
         )
-        if key not in self._folded:
-            wildcard = self._grants.get(GrantLoadKey(key.resource_type, "*"))
-            named = self._grants.get(key)
-            if wildcard is None:
-                permission = named
-            elif named is None:
-                permission = wildcard
-            elif wildcard.denied or named.denied:
-                permission = DENY
-            else:
-                permission = get_permission(max_permission(wildcard.name, named.name))
+        memoize = key.resource_type not in self._conditional_types
+        if memoize and key in self._folded:
+            return self._folded[key]
+        permission = self._combine(
+            self._pattern_permission(GrantLoadKey(key.resource_type, "*"), context),
+            self._pattern_permission(key, context),
+        )
+        if memoize:
             self._folded[key] = permission
-        return self._folded[key]
+        return permission
 
 
 def retention_gate(
@@ -1081,12 +1141,18 @@ def _get_permission_from_experiment_id() -> Permission:
 
 
 def _role_grant_for_resource(
-    user_id: int, resource_type: str, resource_key: str, workspace_name: str
+    user_id: int,
+    resource_type: str,
+    resource_key: str,
+    workspace_name: str,
+    context: ConditionContext | None = None,
 ) -> Permission | None:
     grants = store.list_grants(user_id, workspace_name, {resource_type})
     if any(is_workspace_admin_grant(grant) for grant in grants):
         return MANAGE
-    return fold_grants_for_key(grants, GrantLoadKey(resource_type, resource_key))
+    return fold_grants_for_key(
+        applicable_grants(grants, context), GrantLoadKey(resource_type, resource_key)
+    )
 
 
 def _role_permission_for(
@@ -1150,6 +1216,7 @@ def _role_permission_for_known_workspace(
     resource_type: str,
     resource_key: str,
     workspace_name: str | None,
+    context: ConditionContext | None = None,
 ) -> Callable[[], Permission | None]:
     """Like ``_role_permission_for`` but with workspace already resolved.
 
@@ -1168,7 +1235,9 @@ def _role_permission_for_known_workspace(
                 return NO_PERMISSIONS
             resolved_workspace = DEFAULT_WORKSPACE_NAME
         user = store.get_user(username)
-        perm = _role_grant_for_resource(user.id, resource_type, resource_key, resolved_workspace)
+        perm = _role_grant_for_resource(
+            user.id, resource_type, resource_key, resolved_workspace, context
+        )
         if perm is not None:
             return perm
         if not MLFLOW_ENABLE_WORKSPACES.get():
@@ -1558,8 +1627,30 @@ def _registry_name_permission(username: str, resource_type: str, name: str) -> P
             resource_type,
             rm.name if rm is not None else name,
             getattr(rm, "workspace", None),
+            _registry_condition_context(rm),
         )
     )
+
+
+def _registry_row_tags(entity) -> dict[str, str]:
+    """A registry row's own tags, from a proto or an entity, without the prompt marker."""
+    tags = entity.tags
+    items = tags.items() if isinstance(tags, Mapping) else ((t.key, t.value) for t in tags)
+    return {key: value for key, value in items if key != IS_PROMPT_TAG_KEY}
+
+
+def _registry_condition_context(rm, alias: str | None = None) -> ConditionContext:
+    # ``rm=None`` (no such model) leaves the tags unknown rather than empty: a tag condition is
+    # then undecidable and fails closed, instead of reading as "the tag is absent".
+    return ConditionContext(tags=None if rm is None else _registry_row_tags(rm), alias=alias)
+
+
+def _request_alias() -> str | None:
+    try:
+        alias = _get_request_param("alias")
+    except MlflowException:
+        return None
+    return alias if isinstance(alias, str) else None
 
 
 def _get_registered_model_permission(name: str) -> Permission:
@@ -1580,28 +1671,35 @@ def _get_permission_from_prompt_name() -> Permission:
     )
 
 
-def _get_registered_model_or_prompt_permission(name: str) -> Permission:
-    """Resolve a persisted registry entity's permission in its actual namespace."""
+def _get_registered_model_or_prompt_permission(name: str, alias: str | None = None) -> Permission:
+    """Resolve a persisted registry entity's permission in its actual namespace.
+
+    ``alias`` is the alias a set/delete-alias request names, for ``alias_matches`` conditions.
+    """
     username = authenticate_request().username
     rm = _get_model_registry_store().get_registered_model(name)
     resource_type = "prompt" if rm._is_prompt() else "registered_model"
     workspace_name = getattr(rm, "workspace", None)
     return _get_role_permission_or_default(
-        _role_permission_for_known_workspace(username, resource_type, rm.name, workspace_name)
+        _role_permission_for_known_workspace(
+            username, resource_type, rm.name, workspace_name, _registry_condition_context(rm, alias)
+        )
     )
 
 
-def _get_permission_from_registered_model_or_prompt_name() -> Permission:
+def _get_permission_from_registered_model_or_prompt_name(alias: str | None = None) -> Permission:
     """Resolve permission for a shared model-registry route in a single DB round-trip."""
     name = _get_request_param("name")
     try:
-        return _get_registered_model_or_prompt_permission(name)
+        return _get_registered_model_or_prompt_permission(name, alias)
     except MlflowException as e:
         if e.error_code != ErrorCode.Name(RESOURCE_DOES_NOT_EXIST):
             raise
     username = authenticate_request().username
     return _get_role_permission_or_default(
-        _role_permission_for_known_workspace(username, "registered_model", name, None)
+        _role_permission_for_known_workspace(
+            username, "registered_model", name, None, _registry_condition_context(None, alias)
+        )
     )
 
 
@@ -2514,14 +2612,15 @@ def _reject_rename_onto_per_user_grants(name: str, new_name: str) -> None:
     )
 
 
-def _validate_can_delete_registered_model_or_prompt():
-    return _get_permission_from_registered_model_or_prompt_name().can_delete
+def _validate_can_delete_registered_model_or_prompt(alias: str | None = None):
+    return _get_permission_from_registered_model_or_prompt_name(alias).can_delete
 
 
-def _alias_version_requirement_met() -> bool:
-    target = _registered_model_or_prompt_target()
-    if target is None:
+def _alias_version_requirement_met(alias: str | None = None) -> bool:
+    resolved = _registered_model_or_prompt_target_with_context(alias)
+    if resolved is None:
         return False
+    target, context = resolved
     container_type, name = target
     version_type = (
         RESOURCE_TYPE_PROMPT_VERSION
@@ -2533,21 +2632,28 @@ def _alias_version_requirement_met() -> bool:
         authenticate_request().username,
         container,
         [Requirement(version_type, "*", "read", fallback_if_no_grant=(container,))],
+        context,
     )
 
 
 def validate_can_set_model_or_prompt_version_alias() -> bool:
-    return _validate_can_update_registered_model_or_prompt() and _alias_version_requirement_met()
+    alias = _request_alias()
+    can_update = _get_permission_from_registered_model_or_prompt_name(alias).can_update
+    return can_update and _alias_version_requirement_met(alias)
 
 
 def validate_can_delete_model_or_prompt_version_alias() -> bool:
-    return _validate_can_delete_registered_model_or_prompt() and _alias_version_requirement_met()
+    alias = _request_alias()
+    return _validate_can_delete_registered_model_or_prompt(alias) and (
+        _alias_version_requirement_met(alias)
+    )
 
 
 def _authorize_version_action(action: str) -> bool:
-    target = _registered_model_or_prompt_target()
-    if target is None:
+    resolved = _registered_model_or_prompt_target_with_context()
+    if resolved is None:
         return False
+    target, context = resolved
     container_type, name = target
     version_type = (
         RESOURCE_TYPE_PROMPT_VERSION
@@ -2562,6 +2668,7 @@ def _authorize_version_action(action: str) -> bool:
             Requirement(container_type, name, "read"),
             Requirement(version_type, "*", action, fallback_if_no_grant=(container,)),
         ],
+        context,
     )
 
 
@@ -2570,9 +2677,10 @@ def validate_can_delete_registered_model_or_prompt_cascade():
     tier carries ``delete`` with the parent as fallback. Not shared with the alias routes, which
     mutate the parent's alias map and destroy no version.
     """
-    target = _registered_model_or_prompt_target()
-    if target is None:
+    resolved = _registered_model_or_prompt_target_with_context()
+    if resolved is None:
         return False
+    target, context = resolved
     container_type, name = target
     version_type = (
         RESOURCE_TYPE_PROMPT_VERSION
@@ -2587,6 +2695,7 @@ def validate_can_delete_registered_model_or_prompt_cascade():
             Requirement(container_type, name, "delete"),
             Requirement(version_type, "*", "delete", fallback_if_no_grant=(container,)),
         ],
+        context,
     ):
         return False
     # Checked after authorization so the error cannot reveal the stored name to a denied caller.
@@ -2679,9 +2788,10 @@ def validate_can_list_gateway_model_definitions():
 
 
 def validate_can_read_model_or_prompt_version():
-    target = _registered_model_or_prompt_target()
-    if target is None:
+    resolved = _registered_model_or_prompt_target_with_context()
+    if resolved is None:
         return False
+    target, context = resolved
     container_type, name = target
     version_type = (
         RESOURCE_TYPE_PROMPT_VERSION
@@ -2695,6 +2805,7 @@ def validate_can_read_model_or_prompt_version():
             Requirement(container_type, name, "read"),
             Requirement(version_type, "*", ACTION_NOT_DENIED),
         ],
+        context,
     )
 
 
@@ -2710,15 +2821,29 @@ def _validate_can_manage_registered_model_or_prompt():
     return _get_permission_from_registered_model_or_prompt_name().can_manage
 
 
-def _registered_model_or_prompt_target() -> "tuple[str, str] | None":
+def _registered_model_or_prompt_target_with_context(
+    alias: str | None = None,
+) -> "tuple[tuple[str, str], ConditionContext] | None":
+    """The request's model or prompt and the live context its conditions are judged in.
+
+    One fetch gives both, so the tags a condition reads are the ones persisted right now.
+    """
     name = _get_request_param("name")
     rm = _fetch_or_none(_get_model_registry_store().get_registered_model, name)
     if rm is None:
         return None
-    return (RESOURCE_TYPE_PROMPT if rm._is_prompt() else RESOURCE_TYPE_REGISTERED_MODEL), rm.name
+    target = (RESOURCE_TYPE_PROMPT if rm._is_prompt() else RESOURCE_TYPE_REGISTERED_MODEL), rm.name
+    return target, _registry_condition_context(rm, alias)
 
 
-def _authorize_create_version(target: "tuple[str, str]") -> bool:
+def _registered_model_or_prompt_target() -> "tuple[str, str] | None":
+    resolved = _registered_model_or_prompt_target_with_context()
+    return None if resolved is None else resolved[0]
+
+
+def _authorize_create_version(
+    target: "tuple[str, str]", context: ConditionContext | None = None
+) -> bool:
     container_type, name = target
     version_type = (
         RESOURCE_TYPE_PROMPT_VERSION
@@ -2732,6 +2857,7 @@ def _authorize_create_version(target: "tuple[str, str]") -> bool:
             Requirement(container_type, name, "update"),
             Requirement(version_type, "*", ACTION_NOT_DENIED),
         ],
+        context,
     )
 
 
@@ -2773,8 +2899,11 @@ def _version_type_asserted_against_parent(msg, container_type: str) -> "str | No
 
 
 def validate_can_create_model_version():
-    target = _registered_model_or_prompt_target()
-    if target is None or not _authorize_create_version(target):
+    resolved = _registered_model_or_prompt_target_with_context()
+    if resolved is None:
+        return False
+    target, context = resolved
+    if not _authorize_create_version(target, context):
         return False
     msg = _get_request_message(CreateModelVersion())
     # Before the source branches: a marker disagreeing with the parent means the OTHER version tier
@@ -2809,11 +2938,17 @@ def validate_can_create_model_version():
     return True
 
 
-def _create_not_denied(username: str, created_type: str, resource_id: str = "*") -> bool:
+def _create_not_denied(
+    username: str,
+    created_type: str,
+    resource_id: str = "*",
+    context: ConditionContext | None = None,
+) -> bool:
     return authorize(
         username,
         (RESOURCE_TYPE_WORKSPACE, "*"),
         [Requirement(created_type, resource_id or "*", ACTION_NOT_DENIED)],
+        context,
     )
 
 
@@ -2855,7 +2990,9 @@ def validate_can_create_registered_model() -> bool:
     created_type = (
         RESOURCE_TYPE_PROMPT if _entity_is_prompt(msg) else RESOURCE_TYPE_REGISTERED_MODEL
     )
-    return _workspace_create_not_denied(created_type, msg.name)
+    # No persisted entity exists yet, so the tags the handler is about to store are the truth.
+    context = ConditionContext(tags={tag.key: tag.value for tag in msg.tags})
+    return _create_not_denied(authenticate_request().username, created_type, msg.name, context)
 
 
 def validate_can_create_mcp_server(username: str, name: str = "*") -> bool:
@@ -3482,6 +3619,11 @@ def _entity_is_prompt(entity) -> bool:
     return _prompt_marker_in_tags(entity.tags) is True
 
 
+def _predicate_has_conditional_grants(predicate: Callable[..., bool]) -> bool:
+    gate = getattr(predicate, "gate", None)
+    return gate is not None and gate.has_conditional_grants(RESOURCE_TYPE_REGISTERED_MODEL)
+
+
 def _rm_or_prompt_read_predicate(username: str) -> Callable[[Any], bool]:
     """Build a ``p(entity) -> bool`` for filtering shared registered-model /
     model-version search responses. Classifies each row by its
@@ -3489,9 +3631,15 @@ def _rm_or_prompt_read_predicate(username: str) -> Callable[[Any], bool]:
     """
     can_read_rm = _role_based_read_predicate(username, "registered_model")
     can_read_prompt = _role_based_read_predicate(username, "prompt")
+    conditional = _predicate_has_conditional_grants(can_read_rm)
 
     def can_read(entity) -> bool:
-        return (can_read_prompt if _entity_is_prompt(entity) else can_read_rm)(entity.name)
+        if _entity_is_prompt(entity):
+            return can_read_prompt(entity.name)
+        if not conditional:
+            return can_read_rm(entity.name)
+        # The row's own tags, so a search lists exactly what the point route would allow.
+        return can_read_rm(entity.name, ConditionContext(tags=_registry_row_tags(entity)))
 
     return can_read
 
@@ -3507,9 +3655,30 @@ def _rm_or_prompt_version_read_predicate(username: str) -> Callable[[Any], bool]
         "prompt",
         also_require=[Requirement(RESOURCE_TYPE_PROMPT_VERSION, "*", ACTION_NOT_DENIED)],
     )
+    conditional = _predicate_has_conditional_grants(can_read_rm)
+    parent_tags: dict[str, Mapping[str, str] | None] = {}
+
+    def tags_of(entity) -> "Mapping[str, str] | None":
+        # A registered-model row (its latest versions are being judged) carries its own tags; a
+        # version row carries only the version's, so the parent's are read once per name.
+        if hasattr(entity, "latest_versions"):
+            return _registry_row_tags(entity)
+        if entity.name not in parent_tags:
+            try:
+                parent = _get_model_registry_store().get_registered_model(entity.name)
+                parent_tags[entity.name] = _registry_row_tags(parent)
+            except Exception:
+                # Unknown tags: a positive grant on a tag condition does not apply, a DENY does.
+                _logger.exception("Failed to read the tags of model '%s'", entity.name)
+                parent_tags[entity.name] = None
+        return parent_tags[entity.name]
 
     def can_read(entity) -> bool:
-        return (can_read_prompt if _entity_is_prompt(entity) else can_read_rm)(entity.name)
+        if _entity_is_prompt(entity):
+            return can_read_prompt(entity.name)
+        if not conditional:
+            return can_read_rm(entity.name)
+        return can_read_rm(entity.name, ConditionContext(tags=tags_of(entity)))
 
     return can_read
 
@@ -3557,8 +3726,14 @@ def _role_based_read_predicate(
     gate = retention_gate(username, (RESOURCE_TYPE_WORKSPACE, "*"), [row_template, *also_require])
     for requirement in also_require:
         if not gate.retains(requirement.resource_type, requirement.resource_id):
-            return lambda _resource_id: False
-    return lambda resource_id: gate.retains(resource_type, resource_id)
+            return lambda _resource_id, _context=None: False
+
+    def can_read(resource_id: str, context: ConditionContext | None = None) -> bool:
+        return gate.retains(resource_type, resource_id, context)
+
+    # Lets a caller that judges rows by their attributes ask whether it needs to look them up.
+    can_read.gate = gate
+    return can_read
 
 
 def _get_readable_resource_ids(username: str, resource_type: str) -> set[str] | None:
@@ -4352,9 +4527,10 @@ def validate_can_read_model_version_artifact():
     """
     if not _get_permission_from_model_version().can_read:
         return False
-    target = _registered_model_or_prompt_target()
-    if target is None:
+    resolved = _registered_model_or_prompt_target_with_context()
+    if resolved is None:
         return False
+    target, context = resolved
     container_type, name = target
     version_type = (
         RESOURCE_TYPE_PROMPT_VERSION
@@ -4373,6 +4549,7 @@ def validate_can_read_model_version_artifact():
                 fallback_if_no_grant=(container,),
             )
         ],
+        context,
     )
 
 
@@ -6419,7 +6596,13 @@ def add_role_permission():
     resource_type = _get_request_param("resource_type")
     resource_pattern = _get_request_param("resource_pattern")
     permission = _get_request_param("permission")
-    rp = store.add_role_permission(role_id, resource_type, resource_pattern, permission)
+    try:
+        condition = _get_request_param("condition")
+    except MlflowException:
+        condition = None
+    rp = store.add_role_permission(
+        role_id, resource_type, resource_pattern, permission, condition=condition
+    )
     return jsonify({"role_permission": rp.to_json()})
 
 
@@ -6441,7 +6624,12 @@ def list_role_permissions():
 def update_role_permission():
     role_permission_id = _get_int_request_param("role_permission_id")
     permission = _get_request_param("permission")
-    rp = store.update_role_permission(role_permission_id, permission)
+    # An absent key keeps the stored condition; an explicit null clears it.
+    try:
+        condition = _get_request_param("condition")
+    except MlflowException:
+        condition = UNSET
+    rp = store.update_role_permission(role_permission_id, permission, condition=condition)
     return jsonify({"role_permission": rp.to_json()})
 
 
@@ -8176,6 +8364,7 @@ class _UserRolePermissionRow:
     resource_type: str
     resource_pattern: str
     permission: str
+    condition: dict | None = None
 
 
 def _list_user_role_permissions(username: str) -> tuple[bool, list[_UserRolePermissionRow]]:
@@ -8197,6 +8386,7 @@ def _list_user_role_permissions(username: str) -> tuple[bool, list[_UserRolePerm
             resource_type=rp.resource_type,
             resource_pattern=rp.resource_pattern,
             permission=rp.permission,
+            condition=rp.condition,
         )
         for role in store.list_user_roles(user.id)
         for rp in role.permissions

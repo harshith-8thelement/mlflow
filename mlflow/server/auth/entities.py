@@ -414,12 +414,13 @@ class Role:
 
 
 class RolePermission:
-    def __init__(self, id_, role_id, resource_type, resource_pattern, permission):
+    def __init__(self, id_, role_id, resource_type, resource_pattern, permission, condition=None):
         self._id = id_
         self._role_id = role_id
         self._resource_type = resource_type
         self._resource_pattern = resource_pattern
         self._permission = permission
+        self._condition = condition
 
     @property
     def id(self):
@@ -445,6 +446,10 @@ class RolePermission:
     def permission(self, permission):
         self._permission = permission
 
+    @property
+    def condition(self):
+        return self._condition
+
     def to_json(self):
         return {
             "id": self.id,
@@ -452,6 +457,7 @@ class RolePermission:
             "resource_type": self.resource_type,
             "resource_pattern": self.resource_pattern,
             "permission": self.permission,
+            "condition": self.condition,
         }
 
     @classmethod
@@ -462,6 +468,7 @@ class RolePermission:
             resource_type=dictionary["resource_type"],
             resource_pattern=dictionary["resource_pattern"],
             permission=dictionary["permission"],
+            condition=dictionary.get("condition"),
         )
 
 

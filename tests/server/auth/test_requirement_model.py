@@ -508,3 +508,10 @@ def test_invoke_scorer_version_grant_does_not_rescue_a_scorer_deny():
         grant(RESOURCE_TYPE_SCORER_VERSION, "*", READ.name),
     ]
     assert decide(requirements, rows) is False
+
+
+def test_fold_without_condition_attribute_is_unchanged():
+    key = GrantLoadKey("registered_model", "m")
+    rows = [grant("registered_model", "*", EDIT.name), grant("registered_model", "m", READ.name)]
+    assert fold_grants_for_key(rows, key) == EDIT
+    assert fold_grants_for_key([grant("registered_model", "*", DENY.name)], key) == DENY
