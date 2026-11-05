@@ -19,6 +19,7 @@ Two folds, and they are different operations:
 
 from typing import TYPE_CHECKING, NamedTuple
 
+from mlflow.server.auth.conditions import ConditionContext, grant_applies
 from mlflow.server.auth.permissions import (
     DENY,
     MANAGE,
@@ -144,6 +145,25 @@ def is_workspace_admin_grant(grant: "RoleGrantRow") -> bool:
     )
 
 
+def applicable_grants(
+    grants: "Sequence[RoleGrantRow]", context: ConditionContext | None
+) -> "list[RoleGrantRow]":
+    """The grants that take part in the fold for a request described by ``context``.
+
+    Unconditional rows pass through unchanged. A conditional row is kept only if its
+    condition holds (see ``grant_applies`` for the fail-closed handling of an undecidable
+    one), with the condition cleared so the fold sees it as an ordinary grant. Rows whose
+    condition does not hold are dropped silently, as if the role never held them.
+    """
+    result = []
+    for grant in grants:
+        if getattr(grant, "condition", None) is None:
+            result.append(grant)
+        elif grant_applies(grant, context):
+            result.append(grant._replace(condition=None))
+    return result
+
+
 def fold_grants_for_key(grants: "Sequence[RoleGrantRow]", key: GrantLoadKey) -> Permission | None:
     # None means SILENT, not "no access": only the fold across keys knows whether a
     # fallback key or the default should speak next.
@@ -153,6 +173,12 @@ def fold_grants_for_key(grants: "Sequence[RoleGrantRow]", key: GrantLoadKey) -> 
         if grant.resource_type != key.resource_type:
             continue
         if not matches(grant.resource_pattern, key.resource_type, key.resource_id):
+            continue
+        # A condition must be resolved by ``applicable_grants`` before folding. One that
+        # reaches the fold unresolved fails closed: a DENY still vetoes, a grant is ignored.
+        if getattr(grant, "condition", None) is not None:
+            if grant.permission == DENY.name:
+                denied = True
             continue
         if grant.permission == DENY.name:
             denied = True

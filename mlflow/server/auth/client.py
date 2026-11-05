@@ -1,3 +1,4 @@
+from mlflow.server.auth.conditions import UNSET
 from mlflow.server.auth.entities import (
     GetUserPermissionResult,
     Role,
@@ -290,7 +291,12 @@ class AuthServiceClient:
         self._request(DELETE_ROLE, "DELETE", json={"role_id": role_id})
 
     def add_role_permission(
-        self, role_id: int, resource_type: str, resource_pattern: str, permission: str
+        self,
+        role_id: int,
+        resource_type: str,
+        resource_pattern: str,
+        permission: str,
+        condition: dict | None = None,
     ) -> RolePermission:
         """Grant ``permission`` on resources of ``resource_type`` matching ``resource_pattern``.
 
@@ -310,19 +316,31 @@ class AuthServiceClient:
                 explicit-deny override that wins over any positive grant it is folded with, and
                 applies at the tier it is granted on. ``workspace`` accepts only ``USE`` and
                 ``MANAGE``.
+            condition: Optional condition narrowing a ``registered_model`` permission; the
+                permission then applies only where the condition holds. One of
+                ``{"type": "tag_equals", "key": <str>, "value": <str>}`` (the model has the tag),
+                ``{"type": "tag_not_equals", "key": <str>, "value": <str>}`` (the model lacks the
+                tag or has a different value), or
+                ``{"type": "alias_matches", "aliases": [<name or glob>, ...]}`` (the alias being
+                set or deleted matches one of the names or glob patterns, e.g.
+                ``"production-*"``). ``None`` (the default) means unconditional. Any other type or
+                shape, or a condition on another resource type, is rejected.
 
         Returns:
             The created :py:class:`RolePermission`.
         """
+        payload = {
+            "role_id": role_id,
+            "resource_type": resource_type,
+            "resource_pattern": resource_pattern,
+            "permission": permission,
+        }
+        if condition is not None:
+            payload["condition"] = condition
         resp = self._request(
             ADD_ROLE_PERMISSION,
             "POST",
-            json={
-                "role_id": role_id,
-                "resource_type": resource_type,
-                "resource_pattern": resource_pattern,
-                "permission": permission,
-            },
+            json=payload,
         )
         return RolePermission.from_json(resp["role_permission"])
 
@@ -335,12 +353,26 @@ class AuthServiceClient:
         resp = self._request(LIST_ROLE_PERMISSIONS, "GET", params={"role_id": str(role_id)})
         return [RolePermission.from_json(p) for p in resp["role_permissions"]]
 
-    def update_role_permission(self, role_permission_id: int, permission: str) -> RolePermission:
-        resp = self._request(
-            UPDATE_ROLE_PERMISSION,
-            "PATCH",
-            json={"role_permission_id": role_permission_id, "permission": permission},
-        )
+    def update_role_permission(
+        self, role_permission_id: int, permission: str, condition=UNSET
+    ) -> RolePermission:
+        """Change the permission, and optionally the condition, of a role permission.
+
+        Args:
+            role_permission_id: The role permission to update.
+            permission: The new permission level.
+            condition: Left at its default, the stored condition is kept. A condition dict
+                (``tag_equals``, ``tag_not_equals`` or ``alias_matches``; see
+                :py:meth:`add_role_permission`) replaces it, and ``None`` clears it so the
+                permission becomes unconditional.
+
+        Returns:
+            The updated :py:class:`RolePermission`.
+        """
+        payload = {"role_permission_id": role_permission_id, "permission": permission}
+        if condition is not UNSET:
+            payload["condition"] = condition
+        resp = self._request(UPDATE_ROLE_PERMISSION, "PATCH", json=payload)
         return RolePermission.from_json(resp["role_permission"])
 
     def assign_role(self, username: str, role_id: int) -> UserRoleAssignment:

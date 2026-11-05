@@ -145,7 +145,7 @@ def test_upgrade_from_legacy_database(tmp_path: Path) -> None:
     assert "scorer_permissions" in tables
     assert "registered_model_permissions" in tables
     assert "workspace_permissions" in tables
-    assert version[0] == "f1a2b3c4d5e6"
+    assert version[0] == "b2c3d4e5f6a7"
     assert user == ("testuser", 1)
 
 
@@ -754,3 +754,87 @@ def test_promote_prompt_resource_type_downgrade_collapses_to_registered_model(
         cursor.execute("SELECT resource_type, resource_pattern FROM role_permissions")
         rows = cursor.fetchall()
     assert rows == [("registered_model", "prompt-foo")]
+
+
+def _role_permission_columns(db: Path) -> set[str]:
+    with sqlite3.connect(db) as conn:
+        return {row[1] for row in conn.execute("PRAGMA table_info(role_permissions)")}
+
+
+def test_add_role_permission_condition_upgrade_preserves_rows(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db = tmp_path / "test.db"
+    db_url = f"sqlite:///{db}"
+
+    res = runner.invoke(
+        cli.upgrade, ["--url", db_url, "--revision", "f1a2b3c4d5e6"], catch_exceptions=False
+    )
+    assert res.exit_code == 0, res.output
+    assert "condition_json" not in _role_permission_columns(db)
+
+    with sqlite3.connect(db) as conn:
+        conn.execute("INSERT INTO roles (id, workspace, name) VALUES (1, 'default', 'r')")
+        conn.execute(
+            "INSERT INTO role_permissions "
+            "(role_id, resource_type, resource_pattern, permission) VALUES "
+            "(1, 'registered_model', 'm1', 'READ'), (1, 'experiment', '*', 'EDIT')"
+        )
+        conn.commit()
+
+    res = runner.invoke(cli.upgrade, ["--url", db_url], catch_exceptions=False)
+    assert res.exit_code == 0, res.output
+    assert "condition_json" in _role_permission_columns(db)
+
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            "SELECT role_id, resource_type, resource_pattern, permission, condition_json "
+            "FROM role_permissions ORDER BY id"
+        ).fetchall()
+        # The unique constraint survives the batch table rebuild.
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'role_permissions'"
+        ).fetchone()[0]
+    assert rows == [
+        (1, "registered_model", "m1", "READ", None),
+        (1, "experiment", "*", "EDIT", None),
+    ]
+    assert "unique_role_resource_perm" in sql
+
+
+def test_add_role_permission_condition_downgrade_is_fail_closed(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db = tmp_path / "test.db"
+    db_url = f"sqlite:///{db}"
+
+    res = runner.invoke(cli.upgrade, ["--url", db_url], catch_exceptions=False)
+    assert res.exit_code == 0, res.output
+
+    condition = '{"type":"alias_matches","aliases":["a"]}'
+    with sqlite3.connect(db) as conn:
+        conn.execute("INSERT INTO roles (id, workspace, name) VALUES (1, 'default', 'r')")
+        conn.executemany(
+            "INSERT INTO role_permissions "
+            "(role_id, resource_type, resource_pattern, permission, condition_json) "
+            "VALUES (1, ?, ?, ?, ?)",
+            [
+                ("registered_model", "plain", "READ", None),
+                ("registered_model", "cond-edit", "EDIT", condition),
+                ("registered_model", "cond-deny", "DENY", condition),
+            ],
+        )
+        conn.commit()
+
+    _alembic_downgrade(db_url, "f1a2b3c4d5e6")
+    assert "condition_json" not in _role_permission_columns(db)
+
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            "SELECT resource_pattern, permission FROM role_permissions ORDER BY resource_pattern"
+        ).fetchall()
+    # The conditional EDIT is dropped rather than widened to every model; the conditional DENY
+    # stays and now applies unconditionally.
+    assert rows == [("cond-deny", "DENY"), ("plain", "READ")]
+
+    res = runner.invoke(cli.upgrade, ["--url", db_url], catch_exceptions=False)
+    assert res.exit_code == 0, res.output
+    assert "condition_json" in _role_permission_columns(db)
