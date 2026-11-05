@@ -44,7 +44,7 @@ to the <APILink fn="mlflow.server.cli" hash="mlflow-models">MLflow CLI Reference
 
 ### Endpoints
 
-The inference server provides 4 endpoints:
+The inference server provides 4 endpoints, plus an optional `/metrics` endpoint:
 
 - `/invocations`: An inference endpoint that accepts POST requests with input data and returns predictions.
 
@@ -53,6 +53,8 @@ The inference server provides 4 endpoints:
 - `/health`: Same as /ping
 
 - `/version`: Returns the MLflow version.
+
+- `/metrics`: Prometheus metrics. Only available when `prometheus_multiproc_dir` is set. See [Prometheus Metrics](#prometheus-metrics).
 
 ### Accepted Input Formats
 
@@ -246,6 +248,35 @@ curl http://127.0.0.1:5000/invocations -H 'Content-Type: application/json' -d '[
     {"a": 2, "b": "2021-03-01T00:00:00Z"}
 ]'
 ```
+
+### Prometheus Metrics
+
+The inference server can optionally expose Prometheus metrics. This is off by default: when it is not enabled, there is no `/metrics` endpoint and no metrics are collected.
+
+To enable it, set the `prometheus_multiproc_dir` environment variable (the same setting the MLflow tracking server uses) to a directory path before starting the server, and install [`prometheus_client`](https://github.com/prometheus/client_python) in the serving environment:
+
+```bash
+mkdir -p /tmp/mlflow_scoring_metrics
+prometheus_multiproc_dir=/tmp/mlflow_scoring_metrics mlflow models serve -m runs:/<run_id>/model -p 5000
+curl http://127.0.0.1:5000/metrics
+```
+
+If `prometheus_multiproc_dir` is set but `prometheus_client` is not installed, the server logs a warning, keeps serving predictions, and metrics stay off.
+
+The following metrics are recorded for scoring requests such as `/invocations`:
+
+- `mlflow_scoring_server_http_request_total{path, status}`: a counter of requests by path and HTTP status code. Requests that hit the scoring timeout are recorded with status `504`.
+- `mlflow_scoring_server_http_request_duration_seconds{path}`: a histogram of request latency in seconds by path.
+
+Requests to `/ping`, `/health`, `/version` and `/metrics` are not recorded. Requests to any other unknown path are all grouped under the single label value `other`, so the label values stay bounded.
+
+The metrics use `prometheus_client` multiprocess mode, so when the server runs with more than one worker, a single scrape of `/metrics` includes the requests handled by every worker.
+
+:::note
+Metric files for dead or restarted workers, and files left in a reused directory, are not cleaned up beyond what `prometheus_client` provides, so stale data can show up in later scrapes. Use a fresh, empty directory each time you start the server.
+:::
+
+In the Docker image, nginx listens on port 8080 and does not proxy `/metrics`. Scrape the scoring server directly on port 8000 instead.
 
 ## Serving Framework
 
