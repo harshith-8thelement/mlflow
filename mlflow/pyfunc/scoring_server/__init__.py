@@ -11,6 +11,9 @@ Defines four endpoints:
     /health (same as /ping)
     /version used for getting the mlflow version
     /invocations used for scoring
+
+Optionally, if the ``prometheus_multiproc_dir`` environment variable is set, a ``/metrics``
+endpoint exposing Prometheus metrics is also defined.
 """
 
 import asyncio
@@ -36,6 +39,7 @@ from mlflow.environment_variables import (
 # ALl of the mlflow dependencies below need to be backwards compatible.
 from mlflow.exceptions import MlflowException
 from mlflow.pyfunc.model import _log_warning_if_params_not_in_predict_signature
+from mlflow.pyfunc.scoring_server._prometheus import maybe_enable_prometheus_metrics
 from mlflow.types import ParamSchema, Schema
 from mlflow.utils import reraise
 from mlflow.utils.file_utils import path_to_local_file_uri
@@ -498,6 +502,8 @@ def init(model: PyFuncModel):
         return Response(
             content=result.response, status_code=result.status, media_type=result.mimetype
         )
+
+    maybe_enable_prometheus_metrics(app)
 
     return app
 
