@@ -2,6 +2,7 @@ import sqlite3
 from pathlib import Path
 from urllib.parse import quote
 
+import pytest
 from alembic.command import downgrade as alembic_downgrade
 from click.testing import CliRunner
 
@@ -145,7 +146,7 @@ def test_upgrade_from_legacy_database(tmp_path: Path) -> None:
     assert "scorer_permissions" in tables
     assert "registered_model_permissions" in tables
     assert "workspace_permissions" in tables
-    assert version[0] == "f1a2b3c4d5e6"
+    assert version[0] == "d7e8f9a0b1c2"
     assert user == ("testuser", 1)
 
 
@@ -754,3 +755,110 @@ def test_promote_prompt_resource_type_downgrade_collapses_to_registered_model(
         cursor.execute("SELECT resource_type, resource_pattern FROM role_permissions")
         rows = cursor.fetchall()
     assert rows == [("registered_model", "prompt-foo")]
+
+
+def _seed_role_permissions(db: Path) -> None:
+    with sqlite3.connect(db) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO roles (id, workspace, name) VALUES (1, 'default', 'editor'), "
+            "(2, 'default', 'viewer')"
+        )
+        cursor.execute(
+            "INSERT INTO role_permissions "
+            "(role_id, resource_type, resource_pattern, permission) VALUES "
+            "(1, 'registered_model', '*', 'EDIT'), "
+            "(2, 'experiment', '1', 'READ')"
+        )
+        conn.commit()
+
+
+def test_role_permission_condition_migration_upgrade_preserves_rows(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db = tmp_path / "test.db"
+    db_url = f"sqlite:///{db}"
+
+    res = runner.invoke(
+        cli.upgrade, ["--url", db_url, "--revision", "f1a2b3c4d5e6"], catch_exceptions=False
+    )
+    assert res.exit_code == 0, res.output
+    _seed_role_permissions(db)
+
+    res = runner.invoke(cli.upgrade, ["--url", db_url], catch_exceptions=False)
+    assert res.exit_code == 0, res.output
+
+    with sqlite3.connect(db) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT role_id, resource_type, resource_pattern, permission, condition, condition_key "
+            "FROM role_permissions ORDER BY role_id"
+        )
+        rows = cursor.fetchall()
+        cursor.execute("SELECT version_num FROM alembic_version_auth;")
+        version = cursor.fetchone()
+        # The widened constraint lets one pattern carry entries that differ by condition...
+        cursor.execute(
+            "INSERT INTO role_permissions "
+            "(role_id, resource_type, resource_pattern, permission, condition, condition_key) "
+            "VALUES (1, 'registered_model', '*', 'READ', '{}', 'abc')"
+        )
+        # ...but unconditioned duplicates are still rejected.
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            cursor.execute(
+                "INSERT INTO role_permissions "
+                "(role_id, resource_type, resource_pattern, permission) "
+                "VALUES (1, 'registered_model', '*', 'READ')"
+            )
+    assert version[0] == "d7e8f9a0b1c2"
+    assert rows == [
+        (1, "registered_model", "*", "EDIT", None, ""),
+        (2, "experiment", "1", "READ", None, ""),
+    ]
+
+
+def test_role_permission_condition_migration_downgrade_drops_conditional_rows(
+    tmp_path: Path,
+) -> None:
+    runner = CliRunner()
+    db = tmp_path / "test.db"
+    db_url = f"sqlite:///{db}"
+
+    res = runner.invoke(
+        cli.upgrade, ["--url", db_url, "--revision", "f1a2b3c4d5e6"], catch_exceptions=False
+    )
+    assert res.exit_code == 0, res.output
+    _seed_role_permissions(db)
+    res = runner.invoke(cli.upgrade, ["--url", db_url], catch_exceptions=False)
+    assert res.exit_code == 0, res.output
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO role_permissions "
+            "(role_id, resource_type, resource_pattern, permission, condition, condition_key) "
+            "VALUES (1, 'registered_model', '*', 'READ', '{}', 'abc')"
+        )
+        conn.commit()
+
+    _alembic_downgrade(db_url, "f1a2b3c4d5e6")
+
+    with sqlite3.connect(db) as conn:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(role_permissions)")
+        columns = {c[1] for c in cursor.fetchall()}
+        cursor.execute(
+            "SELECT role_id, resource_type, resource_pattern, permission FROM role_permissions "
+            "ORDER BY role_id"
+        )
+        rows = cursor.fetchall()
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            cursor.execute(
+                "INSERT INTO role_permissions "
+                "(role_id, resource_type, resource_pattern, permission) "
+                "VALUES (1, 'registered_model', '*', 'READ')"
+            )
+    assert "condition" not in columns
+    assert "condition_key" not in columns
+    assert rows == [(1, "registered_model", "*", "EDIT"), (2, "experiment", "1", "READ")]
+
+    res = runner.invoke(cli.upgrade, ["--url", db_url], catch_exceptions=False)
+    assert res.exit_code == 0, res.output

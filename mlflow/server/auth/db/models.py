@@ -5,10 +5,12 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import declarative_base, relationship
 
+from mlflow.server.auth.conditions import parse_condition
 from mlflow.server.auth.entities import (
     Role,
     RolePermission,
@@ -82,9 +84,17 @@ class SqlRolePermission(Base):
     resource_type = Column(String(64), nullable=False)
     resource_pattern = Column(String(255), nullable=False)
     permission = Column(String(255), nullable=False)
+    condition = Column(Text, nullable=True)
+    # Fixed-width identity of ``condition`` ('' when unconditional) so the unique constraint
+    # covers it on every backend; unconditioned rows keep colliding with each other.
+    condition_key = Column(String(64), nullable=False, default="", server_default="")
     __table_args__ = (
         UniqueConstraint(
-            "role_id", "resource_type", "resource_pattern", name="unique_role_resource_perm"
+            "role_id",
+            "resource_type",
+            "resource_pattern",
+            "condition_key",
+            name="unique_role_resource_perm_condition",
         ),
         Index("idx_role_permissions_role_id", "role_id"),
     )
@@ -96,6 +106,7 @@ class SqlRolePermission(Base):
             resource_type=self.resource_type,
             resource_pattern=self.resource_pattern,
             permission=self.permission,
+            condition=parse_condition(self.condition),
         )
 
 

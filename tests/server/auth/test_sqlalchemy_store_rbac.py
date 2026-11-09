@@ -1,6 +1,9 @@
 import pytest
+from flask import Flask, request
 
+import mlflow.server.auth as auth_module
 from mlflow.exceptions import MlflowException
+from mlflow.server.auth.db.models import SqlRolePermission
 from mlflow.server.auth.entities import Role, RolePermission, UserRoleAssignment
 from mlflow.server.auth.permissions import (
     DENY,
@@ -30,7 +33,12 @@ _RESOURCE_GRANT_CASES = [
     for resource_type in sorted(_SKILL_REGISTRY_RESOURCE_TYPES)
     for permission in (READ, EDIT, MANAGE)
 ]
-from mlflow.server.auth.sqlalchemy_store import NamedRoleGrant, PerUserGrant, SqlAlchemyStore
+from mlflow.server.auth.sqlalchemy_store import (
+    NamedRoleGrant,
+    PerUserGrant,
+    RoleGrantRow,
+    SqlAlchemyStore,
+)
 from mlflow.utils.workspace_utils import DEFAULT_WORKSPACE_NAME
 
 from tests.helper_functions import random_str
@@ -343,7 +351,7 @@ def test_add_role_permission_duplicate(store):
         store.add_role_permission(role.id, "experiment", "123", "EDIT")
     assert exc.value.message == (
         f"Role permission (role_id={role.id}, resource_type=experiment, "
-        "resource_pattern=123) already exists."
+        "resource_pattern=123, condition=None) already exists."
     )
 
 
@@ -478,6 +486,334 @@ def test_update_role_permission_invalid_permission(store):
     rp = store.add_role_permission(role.id, "experiment", "123", "READ")
     with pytest.raises(MlflowException, match="Invalid permission"):
         store.update_role_permission(rp.id, "INVALID")
+
+
+# ---- RolePermission conditions ----
+
+TAG_PROMOTED = {"type": "tag_equals", "key": "promoted", "value": "true"}
+TAG_NOT_PROMOTED = {"type": "tag_not_equals", "key": "promoted", "value": "true"}
+ALIASES = {"type": "alias_matches", "aliases": ["staging", "production-*"]}
+
+
+def test_add_role_permission_with_condition_round_trips(store):
+    role = store.create_role(name="editor", workspace="ws1")
+    rp = store.add_role_permission(role.id, "registered_model", "*", "EDIT", TAG_NOT_PROMOTED)
+    assert rp.condition == TAG_NOT_PROMOTED
+    assert rp.to_json()["condition"] == TAG_NOT_PROMOTED
+    assert store.get_role_permission(rp.id).condition == TAG_NOT_PROMOTED
+    assert [p.condition for p in store.list_role_permissions(role.id)] == [TAG_NOT_PROMOTED]
+
+
+def test_role_permission_without_condition_has_none(store):
+    role = store.create_role(name="editor", workspace="ws1")
+    rp = store.add_role_permission(role.id, "registered_model", "*", "EDIT")
+    assert rp.condition is None
+    assert rp.to_json()["condition"] is None
+    assert RolePermission.from_json(rp.to_json()).condition is None
+
+
+def test_role_permission_condition_persists_across_store_restart(store, tmp_sqlite_uri):
+    role = store.create_role(name="editor", workspace="ws1")
+    rp = store.add_role_permission(role.id, "registered_model", "*", "EDIT", ALIASES)
+
+    restarted = SqlAlchemyStore()
+    restarted.init_db(tmp_sqlite_uri)
+    assert restarted.get_role_permission(rp.id).condition == ALIASES
+
+
+def test_same_pattern_can_hold_entries_differing_only_by_condition(store):
+    role = store.create_role(name="editor", workspace="ws1")
+    store.add_role_permission(role.id, "registered_model", "*", "EDIT", TAG_NOT_PROMOTED)
+    store.add_role_permission(role.id, "registered_model", "*", "READ", TAG_PROMOTED)
+    store.add_role_permission(role.id, "registered_model", "*", "READ")
+    assert len(store.list_role_permissions(role.id)) == 3
+
+
+def test_add_role_permission_duplicate_condition_rejected(store):
+    role = store.create_role(name="editor", workspace="ws1")
+    store.add_role_permission(role.id, "registered_model", "*", "EDIT", TAG_PROMOTED)
+    with pytest.raises(MlflowException, match="already exists") as exc:
+        store.add_role_permission(role.id, "registered_model", "*", "READ", TAG_PROMOTED)
+    assert "promoted" in exc.value.message
+    store.add_role_permission(role.id, "registered_model", "*", "EDIT")
+    with pytest.raises(MlflowException, match="already exists"):
+        store.add_role_permission(role.id, "registered_model", "*", "READ")
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        {"type": "unknown", "key": "k", "value": "v"},
+        {"type": "tag_equals", "key": "k"},
+        {"type": "alias_matches", "aliases": []},
+        {"type": "alias_matches", "aliases": "production-*"},
+        {"type": "tag_equals", "key": "k", "value": "v", "extra": 1},
+        "tag_equals",
+    ],
+)
+def test_add_role_permission_rejects_malformed_condition(store, condition):
+    role = store.create_role(name="editor", workspace="ws1")
+    with pytest.raises(MlflowException, match="Invalid condition") as exc:
+        store.add_role_permission(role.id, "registered_model", "*", "EDIT", condition)
+    assert exc.value.error_code == "INVALID_PARAMETER_VALUE"
+    assert store.list_role_permissions(role.id) == []
+
+
+def test_add_role_permission_rejects_condition_on_other_resource_type(store):
+    role = store.create_role(name="editor", workspace="ws1")
+    with pytest.raises(MlflowException, match="registered_model"):
+        store.add_role_permission(role.id, "experiment", "*", "EDIT", TAG_PROMOTED)
+
+
+def _synthetic_role_id(store, user):
+    store.create_registered_model_permission("m", user.username, "READ")
+    (role,) = store.list_user_roles(user.id)
+    assert role.name == f"__user_{user.id}__"
+    return role.id
+
+
+def test_condition_rejected_on_synthetic_user_role(store, user):
+    role_id = _synthetic_role_id(store, user)
+    with pytest.raises(MlflowException, match="per-user") as exc:
+        store.add_role_permission(role_id, "registered_model", "other", "EDIT", TAG_PROMOTED)
+    assert exc.value.error_code == "INVALID_PARAMETER_VALUE"
+
+    (rp,) = store.list_role_permissions(role_id)
+    with pytest.raises(MlflowException, match="per-user"):
+        store.update_role_permission(rp.id, condition=TAG_PROMOTED)
+    assert store.update_role_permission(rp.id, "EDIT").permission == "EDIT"
+
+
+def test_update_role_permission_sets_changes_and_clears_condition(store):
+    role = store.create_role(name="editor", workspace="ws1")
+    rp = store.add_role_permission(role.id, "registered_model", "*", "EDIT")
+
+    updated = store.update_role_permission(rp.id, condition=TAG_PROMOTED)
+    assert (updated.permission, updated.condition) == ("EDIT", TAG_PROMOTED)
+
+    updated = store.update_role_permission(rp.id, "READ")
+    assert (updated.permission, updated.condition) == ("READ", TAG_PROMOTED)
+
+    updated = store.update_role_permission(rp.id, "MANAGE", condition=ALIASES)
+    assert (updated.permission, updated.condition) == ("MANAGE", ALIASES)
+
+    updated = store.update_role_permission(rp.id, condition=None)
+    assert updated.condition is None
+    assert store.get_role_permission(rp.id).condition is None
+    # Clearing restores unconditional uniqueness semantics.
+    with pytest.raises(MlflowException, match="already exists"):
+        store.add_role_permission(role.id, "registered_model", "*", "READ")
+
+
+def test_update_role_permission_requires_permission_or_condition(store):
+    role = store.create_role(name="editor", workspace="ws1")
+    rp = store.add_role_permission(role.id, "registered_model", "*", "EDIT")
+    with pytest.raises(MlflowException, match="At least one") as exc:
+        store.update_role_permission(rp.id)
+    assert exc.value.error_code == "INVALID_PARAMETER_VALUE"
+
+
+def test_update_role_permission_rejects_malformed_condition(store):
+    role = store.create_role(name="editor", workspace="ws1")
+    rp = store.add_role_permission(role.id, "registered_model", "*", "EDIT", TAG_PROMOTED)
+    with pytest.raises(MlflowException, match="Invalid condition"):
+        store.update_role_permission(rp.id, condition={"type": "nope"})
+    assert store.get_role_permission(rp.id).condition == TAG_PROMOTED
+
+
+def test_update_role_permission_condition_collision(store):
+    role = store.create_role(name="editor", workspace="ws1")
+    store.add_role_permission(role.id, "registered_model", "*", "EDIT", TAG_PROMOTED)
+    rp = store.add_role_permission(role.id, "registered_model", "*", "EDIT", TAG_NOT_PROMOTED)
+    with pytest.raises(MlflowException, match="already exists") as exc:
+        store.update_role_permission(rp.id, condition=TAG_PROMOTED)
+    assert exc.value.error_code == "RESOURCE_ALREADY_EXISTS"
+
+
+def test_remove_role_permission_with_condition(store):
+    role = store.create_role(name="editor", workspace="ws1")
+    rp = store.add_role_permission(role.id, "registered_model", "*", "EDIT", TAG_PROMOTED)
+    store.remove_role_permission(rp.id)
+    assert store.list_role_permissions(role.id) == []
+    store.add_role_permission(role.id, "registered_model", "*", "EDIT", TAG_PROMOTED)
+
+
+def test_list_grants_returns_serialized_condition(store, user):
+    role = store.create_role(name="editor", workspace="ws1")
+    store.assign_role_to_user(user.id, role.id)
+    store.add_role_permission(role.id, "registered_model", "*", "EDIT", TAG_PROMOTED)
+    store.add_role_permission(role.id, "registered_model", "plain", "READ")
+    other_ws = store.create_role(name="editor", workspace="ws2")
+    store.assign_role_to_user(user.id, other_ws.id)
+    store.add_role_permission(other_ws.id, "registered_model", "*", "MANAGE", TAG_PROMOTED)
+
+    grants = store.list_grants(user.id, "ws1", ["registered_model"])
+    assert sorted(grants, key=lambda g: g.resource_pattern) == [
+        RoleGrantRow(
+            "registered_model", "*", "EDIT", '{"key":"promoted","type":"tag_equals","value":"true"}'
+        ),
+        RoleGrantRow("registered_model", "plain", "READ", None),
+    ]
+
+
+def test_get_role_permission_for_resource_ignores_conditional_positive_grants(store, user):
+    role = store.create_role(name="editor", workspace="ws1")
+    store.assign_role_to_user(user.id, role.id)
+    store.add_role_permission(role.id, "registered_model", "*", "EDIT", TAG_NOT_PROMOTED)
+    assert store.get_role_permission_for_resource(user.id, "registered_model", "m", "ws1") is None
+
+    store.add_role_permission(role.id, "registered_model", "*", "READ")
+    assert store.get_role_permission_for_resource(user.id, "registered_model", "m", "ws1") == READ
+
+
+def test_get_role_permission_for_resource_conditional_deny_applies(store, user):
+    role = store.create_role(name="editor", workspace="ws1")
+    store.assign_role_to_user(user.id, role.id)
+    store.add_role_permission(role.id, "registered_model", "*", "EDIT")
+    store.add_role_permission(role.id, "registered_model", "*", "DENY", TAG_PROMOTED)
+    assert store.get_role_permission_for_resource(user.id, "registered_model", "m", "ws1") == DENY
+
+
+def test_get_role_permission_for_resource_malformed_stored_condition_denies(store, user):
+    role = store.create_role(name="editor", workspace="ws1")
+    store.assign_role_to_user(user.id, role.id)
+    store.add_role_permission(role.id, "registered_model", "*", "EDIT")
+    with store.ManagedSessionMaker(read_only=False) as session:
+        session.add(
+            SqlRolePermission(
+                role_id=role.id,
+                resource_type="registered_model",
+                resource_pattern="*",
+                permission="READ",
+                condition='{"type":"bogus"}',
+                condition_key="x",
+            )
+        )
+    assert store.get_role_permission_for_resource(user.id, "registered_model", "m", "ws1") == DENY
+
+
+def test_list_role_grants_for_user_in_workspace_drops_conditional_positive_rows(store, user):
+    role = store.create_role(name="editor", workspace="ws1")
+    store.assign_role_to_user(user.id, role.id)
+    store.add_role_permission(role.id, "registered_model", "a", "EDIT", TAG_PROMOTED)
+    store.add_role_permission(role.id, "registered_model", "b", "READ")
+    store.add_role_permission(role.id, "registered_model", "c", "DENY", TAG_PROMOTED)
+    grants = store.list_role_grants_for_user_in_workspace(user.id, "ws1", "registered_model")
+    assert sorted(grants) == [("b", "READ"), ("c", "DENY")]
+
+
+# ---- Role permission REST handlers ----
+
+
+@pytest.fixture
+def handler_store(store, monkeypatch):
+    monkeypatch.setattr(auth_module, "store", store)
+    return store
+
+
+def _call(handler, method, body, **view_args):
+    app = Flask(__name__)
+    with app.test_request_context("/", method=method, json=body):
+        request.view_args = view_args
+        response = handler()
+        return response.status_code, response.get_json()
+
+
+def test_add_role_permission_handler_accepts_and_returns_condition(handler_store):
+    role = handler_store.create_role(name="editor", workspace="ws1")
+    status, payload = _call(
+        auth_module.add_role_permission,
+        "POST",
+        {
+            "role_id": role.id,
+            "resource_type": "registered_model",
+            "resource_pattern": "*",
+            "permission": "EDIT",
+            "condition": TAG_NOT_PROMOTED,
+        },
+    )
+    assert status == 200
+    assert payload["role_permission"]["condition"] == TAG_NOT_PROMOTED
+    assert handler_store.list_role_permissions(role.id)[0].condition == TAG_NOT_PROMOTED
+
+
+def test_add_role_permission_handler_without_condition(handler_store):
+    role = handler_store.create_role(name="editor", workspace="ws1")
+    status, payload = _call(
+        auth_module.add_role_permission,
+        "POST",
+        {
+            "role_id": role.id,
+            "resource_type": "registered_model",
+            "resource_pattern": "*",
+            "permission": "EDIT",
+        },
+    )
+    assert status == 200
+    assert payload["role_permission"]["condition"] is None
+
+
+@pytest.mark.parametrize(
+    ("resource_type", "condition"),
+    [
+        ("registered_model", {"type": "nope"}),
+        ("registered_model", {"type": "tag_equals", "key": "k"}),
+        ("experiment", TAG_PROMOTED),
+    ],
+)
+def test_add_role_permission_handler_rejects_bad_condition(handler_store, resource_type, condition):
+    role = handler_store.create_role(name="editor", workspace="ws1")
+    status, payload = _call(
+        auth_module.add_role_permission,
+        "POST",
+        {
+            "role_id": role.id,
+            "resource_type": resource_type,
+            "resource_pattern": "*",
+            "permission": "EDIT",
+            "condition": condition,
+        },
+    )
+    assert status == 400
+    assert payload["error_code"] == "INVALID_PARAMETER_VALUE"
+    assert handler_store.list_role_permissions(role.id) == []
+
+
+def test_update_role_permission_handler_condition_semantics(handler_store):
+    role = handler_store.create_role(name="editor", workspace="ws1")
+    rp = handler_store.add_role_permission(role.id, "registered_model", "*", "EDIT", TAG_PROMOTED)
+    base = {"role_permission_id": rp.id}
+
+    # Omitted condition keeps it; only the permission changes.
+    status, payload = _call(
+        auth_module.update_role_permission, "PATCH", {**base, "permission": "READ"}
+    )
+    assert status == 200
+    assert payload["role_permission"]["permission"] == "READ"
+    assert payload["role_permission"]["condition"] == TAG_PROMOTED
+
+    # Condition alone is enough.
+    status, payload = _call(
+        auth_module.update_role_permission, "PATCH", {**base, "condition": ALIASES}
+    )
+    assert status == 200
+    assert payload["role_permission"]["condition"] == ALIASES
+
+    # Explicit null clears.
+    status, payload = _call(
+        auth_module.update_role_permission, "PATCH", {**base, "condition": None}
+    )
+    assert status == 200
+    assert payload["role_permission"]["condition"] is None
+
+    status, payload = _call(auth_module.update_role_permission, "PATCH", dict(base))
+    assert status == 400
+
+    status, payload = _call(
+        auth_module.update_role_permission, "PATCH", {**base, "condition": {"type": "nope"}}
+    )
+    assert status == 400
+    assert payload["error_code"] == "INVALID_PARAMETER_VALUE"
 
 
 # ---- User grant batches ----
