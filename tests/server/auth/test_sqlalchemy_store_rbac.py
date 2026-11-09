@@ -1,6 +1,7 @@
 import pytest
 
 from mlflow.exceptions import MlflowException
+from mlflow.server.auth.db.models import SqlRole
 from mlflow.server.auth.entities import Role, RolePermission, UserRoleAssignment
 from mlflow.server.auth.permissions import (
     DENY,
@@ -30,7 +31,13 @@ _RESOURCE_GRANT_CASES = [
     for resource_type in sorted(_SKILL_REGISTRY_RESOURCE_TYPES)
     for permission in (READ, EDIT, MANAGE)
 ]
-from mlflow.server.auth.sqlalchemy_store import NamedRoleGrant, PerUserGrant, SqlAlchemyStore
+from mlflow.server.auth.sqlalchemy_store import (
+    UNSET_CONDITION,
+    NamedRoleGrant,
+    PerUserGrant,
+    RoleGrantRow,
+    SqlAlchemyStore,
+)
 from mlflow.utils.workspace_utils import DEFAULT_WORKSPACE_NAME
 
 from tests.helper_functions import random_str
@@ -343,7 +350,7 @@ def test_add_role_permission_duplicate(store):
         store.add_role_permission(role.id, "experiment", "123", "EDIT")
     assert exc.value.message == (
         f"Role permission (role_id={role.id}, resource_type=experiment, "
-        "resource_pattern=123) already exists."
+        "resource_pattern=123, condition=None) already exists."
     )
 
 
@@ -1316,3 +1323,195 @@ def test_list_per_user_grants_for_resource_ignores_named_roles_and_wildcards(sto
         PerUserGrant(user.username, "registered_model", "renamed", READ.name),
         PerUserGrant(user2.username, "prompt", "renamed", MANAGE.name),
     ])
+
+
+# ---- Role permission conditions ----
+
+_PROMOTED = {"type": "tag_equals", "key": "promoted", "value": "true"}
+_NOT_PROMOTED = {"type": "tag_not_equals", "key": "promoted", "value": "true"}
+_ALIASES = {"type": "alias_matches", "aliases": ["champion", "production-*"]}
+
+
+def test_add_role_permission_with_condition_round_trips(store):
+    role = store.create_role(name="editor", workspace="ws1")
+    rp = store.add_role_permission(role.id, "registered_model", "*", "EDIT", _NOT_PROMOTED)
+    assert rp.condition == _NOT_PROMOTED
+    assert store.get_role_permission(rp.id).condition == _NOT_PROMOTED
+    assert [p.condition for p in store.list_role_permissions(role.id)] == [_NOT_PROMOTED]
+    assert RolePermission.from_json(rp.to_json()).condition == _NOT_PROMOTED
+
+
+def test_add_role_permission_without_condition_has_none(store):
+    role = store.create_role(name="editor", workspace="ws1")
+    rp = store.add_role_permission(role.id, "registered_model", "*", "EDIT")
+    assert rp.condition is None
+    assert rp.to_json()["condition"] is None
+    legacy = rp.to_json()
+    del legacy["condition"]
+    assert RolePermission.from_json(legacy).condition is None
+
+
+def test_add_role_permission_canonicalizes_condition(store):
+    role = store.create_role(name="editor", workspace="ws1")
+    rp = store.add_role_permission(
+        role.id,
+        "registered_model",
+        "*",
+        "EDIT",
+        {"value": "true", "key": "promoted", "type": "tag_equals"},
+    )
+    assert rp.condition == _PROMOTED
+
+
+def test_role_permissions_differing_only_by_condition_coexist(store):
+    role = store.create_role(name="editor", workspace="ws1")
+    store.add_role_permission(role.id, "registered_model", "*", "EDIT", _NOT_PROMOTED)
+    store.add_role_permission(role.id, "registered_model", "*", "READ", _PROMOTED)
+    store.add_role_permission(role.id, "registered_model", "*", "READ")
+    perms = store.list_role_permissions(role.id)
+    assert sorted((p.permission, p.condition is None) for p in perms) == [
+        ("EDIT", False),
+        ("READ", False),
+        ("READ", True),
+    ]
+
+
+def test_add_role_permission_duplicate_condition(store):
+    role = store.create_role(name="editor", workspace="ws1")
+    store.add_role_permission(role.id, "registered_model", "*", "EDIT", _PROMOTED)
+    with pytest.raises(MlflowException, match="already exists") as exc:
+        store.add_role_permission(role.id, "registered_model", "*", "READ", dict(_PROMOTED))
+    assert exc.value.error_code == "RESOURCE_ALREADY_EXISTS"
+    assert "tag_equals" in exc.value.message
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        {"type": "nope"},
+        {"type": "tag_equals", "key": "k"},
+        {"type": "alias_matches", "aliases": []},
+        {"type": "tag_equals", "key": "k", "value": "v", "extra": 1},
+        "tag_equals",
+    ],
+)
+def test_add_role_permission_rejects_malformed_condition(store, condition):
+    role = store.create_role(name="editor", workspace="ws1")
+    with pytest.raises(MlflowException, match="ondition") as exc:
+        store.add_role_permission(role.id, "registered_model", "*", "EDIT", condition)
+    assert exc.value.error_code == "INVALID_PARAMETER_VALUE"
+    assert store.list_role_permissions(role.id) == []
+
+
+@pytest.mark.parametrize("resource_type", ["experiment", "prompt", "gateway_endpoint"])
+def test_add_role_permission_rejects_condition_on_other_resource_types(store, resource_type):
+    role = store.create_role(name="editor", workspace="ws1")
+    with pytest.raises(MlflowException, match="not supported on resource type") as exc:
+        store.add_role_permission(role.id, resource_type, "*", "READ", _PROMOTED)
+    assert exc.value.error_code == "INVALID_PARAMETER_VALUE"
+
+
+def test_add_role_permission_rejects_condition_on_synthetic_role(store, user):
+    store.grant_user_permission(user.username, "registered_model", "m", "READ")
+    with store.ManagedSessionMaker() as session:
+        synthetic_id = next(
+            r.id for r in session.query(SqlRole).all() if store._is_synthetic_role_name(r.name)
+        )
+    with pytest.raises(MlflowException, match="per-user") as exc:
+        store.add_role_permission(synthetic_id, "registered_model", "*", "EDIT", _PROMOTED)
+    assert exc.value.error_code == "INVALID_PARAMETER_VALUE"
+
+
+def test_update_role_permission_sets_and_clears_condition(store):
+    role = store.create_role(name="editor", workspace="ws1")
+    rp = store.add_role_permission(role.id, "registered_model", "*", "EDIT")
+
+    updated = store.update_role_permission(rp.id, condition=_ALIASES)
+    assert updated.permission == "EDIT"
+    assert updated.condition == _ALIASES
+    assert store.get_role_permission(rp.id).condition == _ALIASES
+
+    updated = store.update_role_permission(rp.id, "READ", condition=_PROMOTED)
+    assert (updated.permission, updated.condition) == ("READ", _PROMOTED)
+
+    updated = store.update_role_permission(rp.id, "MANAGE")
+    assert (updated.permission, updated.condition) == ("MANAGE", _PROMOTED)
+
+    updated = store.update_role_permission(rp.id, condition=None)
+    assert (updated.permission, updated.condition) == ("MANAGE", None)
+    # Clearing resets the hash, so an unconditioned twin is now a duplicate.
+    with pytest.raises(MlflowException, match="already exists"):
+        store.add_role_permission(role.id, "registered_model", "*", "READ")
+
+
+def test_update_role_permission_requires_a_change(store):
+    role = store.create_role(name="editor", workspace="ws1")
+    rp = store.add_role_permission(role.id, "registered_model", "*", "EDIT")
+    with pytest.raises(MlflowException, match="At least one") as exc:
+        store.update_role_permission(rp.id)
+    assert exc.value.error_code == "INVALID_PARAMETER_VALUE"
+    with pytest.raises(MlflowException, match="At least one"):
+        store.update_role_permission(rp.id, None, UNSET_CONDITION)
+
+
+def test_update_role_permission_rejects_bad_condition(store):
+    role = store.create_role(name="editor", workspace="ws1")
+    rp = store.add_role_permission(role.id, "registered_model", "*", "EDIT", _PROMOTED)
+    with pytest.raises(MlflowException, match="Unknown condition type"):
+        store.update_role_permission(rp.id, condition={"type": "nope"})
+    assert store.get_role_permission(rp.id).condition == _PROMOTED
+
+    exp_rp = store.add_role_permission(role.id, "experiment", "*", "READ")
+    with pytest.raises(MlflowException, match="not supported on resource type"):
+        store.update_role_permission(exp_rp.id, condition=_PROMOTED)
+
+
+def test_update_role_permission_condition_collision(store):
+    role = store.create_role(name="editor", workspace="ws1")
+    store.add_role_permission(role.id, "registered_model", "*", "EDIT", _PROMOTED)
+    other = store.add_role_permission(role.id, "registered_model", "*", "READ", _NOT_PROMOTED)
+    with pytest.raises(MlflowException, match="already exists") as exc:
+        store.update_role_permission(other.id, condition=_PROMOTED)
+    assert exc.value.error_code == "RESOURCE_ALREADY_EXISTS"
+    assert store.get_role_permission(other.id).condition == _NOT_PROMOTED
+
+
+def test_remove_role_permission_with_condition(store):
+    role = store.create_role(name="editor", workspace="ws1")
+    rp = store.add_role_permission(role.id, "registered_model", "*", "EDIT", _PROMOTED)
+    store.remove_role_permission(rp.id)
+    assert store.list_role_permissions(role.id) == []
+    # The slot is free again.
+    store.add_role_permission(role.id, "registered_model", "*", "EDIT", _PROMOTED)
+
+
+def test_list_grants_returns_stored_condition(store, user):
+    role = store.create_role(name="editor", workspace="ws1")
+    store.assign_role_to_user(user.id, role.id)
+    store.add_role_permission(role.id, "registered_model", "*", "EDIT", _NOT_PROMOTED)
+    store.add_role_permission(role.id, "registered_model", "*", "READ")
+    rows = store.list_grants(user.id, "ws1", ["registered_model"])
+    assert all(isinstance(r, RoleGrantRow) for r in rows)
+    assert sorted(rows, key=lambda r: r.permission) == [
+        RoleGrantRow(
+            "registered_model",
+            "*",
+            "EDIT",
+            '{"key":"promoted","type":"tag_not_equals","value":"true"}',
+        ),
+        RoleGrantRow("registered_model", "*", "READ", None),
+    ]
+
+
+def test_role_grant_row_condition_defaults_to_none():
+    assert RoleGrantRow("registered_model", "*", "READ").condition is None
+
+
+def test_get_role_permission_for_resource_ignores_conditional_rows(store, user):
+    role = store.create_role(name="editor", workspace="ws1")
+    store.assign_role_to_user(user.id, role.id)
+    store.add_role_permission(role.id, "registered_model", "*", "MANAGE", _NOT_PROMOTED)
+    assert store.get_role_permission_for_resource(user.id, "registered_model", "m", "ws1") is None
+    store.add_role_permission(role.id, "registered_model", "*", "READ")
+    result = store.get_role_permission_for_resource(user.id, "registered_model", "m", "ws1")
+    assert result == READ

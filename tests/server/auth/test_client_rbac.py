@@ -3,7 +3,7 @@ from contextlib import contextmanager
 import pytest
 import requests
 
-from mlflow import MlflowException
+from mlflow import MlflowClient, MlflowException
 from mlflow.environment_variables import (
     MLFLOW_AUTH_CONFIG_PATH,
     MLFLOW_FLASK_SERVER_SECRET_KEY,
@@ -13,18 +13,21 @@ from mlflow.environment_variables import (
 from mlflow.protos.databricks_pb2 import (
     PERMISSION_DENIED,
     RESOURCE_ALREADY_EXISTS,
+    INVALID_PARAMETER_VALUE,
     RESOURCE_DOES_NOT_EXIST,
     UNAUTHENTICATED,
     ErrorCode,
 )
 from mlflow.server.auth.client import AuthServiceClient
 from mlflow.utils.os import is_windows
+from mlflow.utils.workspace_utils import DEFAULT_WORKSPACE_NAME
 
 from tests.helper_functions import random_str
 from tests.server.auth.auth_test_utils import (
     ADMIN_PASSWORD,
     ADMIN_USERNAME,
     User,
+    create_user,
     write_isolated_auth_config,
 )
 from tests.tracking.integration_test_utils import _init_server
@@ -355,3 +358,234 @@ def test_rbac_endpoints_reachable_at_both_path_prefixes(client, monkeypatch, api
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["role"]["id"] == created.id
+
+
+# ---- Role permission conditions ----
+
+NOT_PROMOTED = {"type": "tag_not_equals", "key": "promoted", "value": "true"}
+PROMOTED = {"type": "tag_equals", "key": "promoted", "value": "true"}
+
+
+@pytest.fixture
+def no_default_client(tmp_path):
+    auth_config_path = write_isolated_auth_config(tmp_path)
+    auth_config_path.write_text(
+        auth_config_path.read_text().replace(
+            "default_permission = READ", "default_permission = NO_PERMISSIONS"
+        )
+    )
+    path = tmp_path.joinpath("sqlalchemy.db").as_uri()
+    backend_uri = ("sqlite://" if is_windows() else "sqlite:////") + path[len("file://") :]
+
+    with _init_server(
+        backend_uri=backend_uri,
+        root_artifact_uri=tmp_path.joinpath("artifacts").as_uri(),
+        app="mlflow.server.auth:create_app",
+        extra_env={
+            MLFLOW_FLASK_SERVER_SECRET_KEY.name: "my-secret-key",
+            MLFLOW_AUTH_CONFIG_PATH.name: str(auth_config_path),
+        },
+        server_type="flask",
+    ) as url:
+        yield AuthServiceClient(url)
+
+
+def test_role_permission_condition_crud(client, monkeypatch):
+    with User(ADMIN_USERNAME, ADMIN_PASSWORD, monkeypatch):
+        role = client.create_role(workspace="ws1", name="cond")
+        plain = client.add_role_permission(role.id, "registered_model", "other", "READ")
+        assert plain.condition is None
+
+        rp = client.add_role_permission(
+            role.id, "registered_model", "*", "EDIT", condition=NOT_PROMOTED
+        )
+        assert rp.condition == NOT_PROMOTED
+
+        by_id = {p.id: p for p in client.list_role_permissions(role.id)}
+        assert by_id[plain.id].condition is None
+        assert by_id[rp.id].condition == NOT_PROMOTED
+
+        # Permission only: the condition is left unchanged.
+        assert client.update_role_permission(rp.id, "MANAGE").condition == NOT_PROMOTED
+
+        # Condition only: the permission is left unchanged.
+        updated = client.update_role_permission(rp.id, condition=PROMOTED)
+        assert updated.permission == "MANAGE"
+        assert updated.condition == PROMOTED
+
+        cleared = client.update_role_permission(rp.id, "EDIT", condition=None)
+        assert cleared.condition is None
+        assert {p.id: p.condition for p in client.list_role_permissions(role.id)} == {
+            plain.id: None,
+            rp.id: None,
+        }
+
+        client.remove_role_permission(rp.id)
+        assert [p.id for p in client.list_role_permissions(role.id)] == [plain.id]
+
+
+def test_role_permissions_differing_only_by_condition_coexist(client, monkeypatch):
+    with User(ADMIN_USERNAME, ADMIN_PASSWORD, monkeypatch):
+        role = client.create_role(workspace="ws1", name="cond")
+        edit = client.add_role_permission(
+            role.id, "registered_model", "*", "EDIT", condition=NOT_PROMOTED
+        )
+        read = client.add_role_permission(
+            role.id, "registered_model", "*", "READ", condition=PROMOTED
+        )
+        assert edit.id != read.id
+        assert len(client.list_role_permissions(role.id)) == 2
+
+        with pytest.raises(MlflowException, match="already exists") as exc:
+            client.add_role_permission(
+                role.id, "registered_model", "*", "MANAGE", condition=PROMOTED
+            )
+        assert exc.value.error_code == ErrorCode.Name(RESOURCE_ALREADY_EXISTS)
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        {"type": "bogus", "key": "k", "value": "v"},
+        {"type": "tag_equals", "key": "k"},
+        {"type": "alias_matches", "aliases": "production-*"},
+        {"type": "alias_matches", "aliases": []},
+        {"key": "k", "value": "v"},
+    ],
+)
+def test_invalid_condition_is_rejected(client, monkeypatch, condition):
+    with User(ADMIN_USERNAME, ADMIN_PASSWORD, monkeypatch):
+        role = client.create_role(workspace="ws1", name="cond")
+        with pytest.raises(MlflowException) as exc:
+            client.add_role_permission(
+                role.id, "registered_model", "*", "EDIT", condition=condition
+            )
+        assert exc.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
+
+        rp = client.add_role_permission(role.id, "registered_model", "*", "EDIT")
+        with pytest.raises(MlflowException) as exc:
+            client.update_role_permission(rp.id, condition=condition)
+        assert exc.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
+        assert client.list_role_permissions(role.id)[0].condition is None
+
+
+def test_condition_on_non_registered_model_is_rejected(client, monkeypatch):
+    with User(ADMIN_USERNAME, ADMIN_PASSWORD, monkeypatch):
+        role = client.create_role(workspace="ws1", name="cond")
+        with pytest.raises(MlflowException) as exc:
+            client.add_role_permission(role.id, "experiment", "*", "EDIT", condition=PROMOTED)
+        assert exc.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
+
+        rp = client.add_role_permission(role.id, "experiment", "*", "EDIT")
+        with pytest.raises(MlflowException) as exc:
+            client.update_role_permission(rp.id, condition=PROMOTED)
+        assert exc.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
+
+
+def test_update_role_permission_requires_permission_or_condition(client, monkeypatch):
+    with User(ADMIN_USERNAME, ADMIN_PASSWORD, monkeypatch):
+        role = client.create_role(workspace="ws1", name="cond")
+        rp = client.add_role_permission(role.id, "registered_model", "*", "EDIT")
+        with pytest.raises(MlflowException, match="At least one of") as exc:
+            client.update_role_permission(rp.id)
+        assert exc.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
+
+
+def test_current_user_permissions_include_condition(client, monkeypatch):
+    username, password = create_user(client.tracking_uri)
+    with User(ADMIN_USERNAME, ADMIN_PASSWORD, monkeypatch):
+        role = client.create_role(workspace=DEFAULT_WORKSPACE_NAME, name="cond")
+        client.add_role_permission(role.id, "registered_model", "*", "READ")
+        client.add_role_permission(
+            role.id, "registered_model", "*", "EDIT", condition=NOT_PROMOTED
+        )
+        client.assign_role(username, role.id)
+
+    resp = requests.get(
+        f"{client.tracking_uri}/api/3.0/mlflow/users/current/permissions",
+        auth=(username, password),
+    )
+    assert resp.status_code == 200, resp.text
+    conditions = {p["permission"]: p["condition"] for p in resp.json()["permissions"]}
+    assert conditions == {"READ": None, "EDIT": NOT_PROMOTED}
+
+
+def test_tag_condition_follows_the_model_through_the_client(no_default_client, monkeypatch):
+    client = no_default_client
+    username, password = create_user(client.tracking_uri)
+    name = f"model-{random_str()}"
+    with User(ADMIN_USERNAME, ADMIN_PASSWORD, monkeypatch):
+        mlflow_client = MlflowClient(client.tracking_uri)
+        role = client.create_role(workspace=DEFAULT_WORKSPACE_NAME, name="cond")
+        client.add_role_permission(
+            role.id, "registered_model", "*", "EDIT", condition=NOT_PROMOTED
+        )
+        client.add_role_permission(role.id, "registered_model", "*", "READ", condition=PROMOTED)
+        client.assign_role(username, role.id)
+        mlflow_client.create_registered_model(name)
+
+    def status(method, path, **kwargs):
+        return requests.request(
+            method,
+            f"{client.tracking_uri}/api/2.0/mlflow/{path}",
+            auth=(username, password),
+            timeout=30,
+            **kwargs,
+        ).status_code
+
+    def read():
+        return status("GET", "registered-models/get", params={"name": name})
+
+    def update():
+        return status("PATCH", "registered-models/update", json={"name": name, "description": "d"})
+
+    def delete():
+        return status("DELETE", "registered-models/delete", json={"name": name})
+
+    assert read() == 200
+    assert update() == 200
+
+    with User(ADMIN_USERNAME, ADMIN_PASSWORD, monkeypatch):
+        mlflow_client.set_registered_model_tag(name, "promoted", "true")
+    assert read() == 200
+    assert update() == 403
+    assert delete() == 403
+
+    with User(ADMIN_USERNAME, ADMIN_PASSWORD, monkeypatch):
+        mlflow_client.delete_registered_model_tag(name, "promoted")
+    assert update() == 200
+
+
+def test_alias_condition_through_the_client(no_default_client, monkeypatch):
+    client = no_default_client
+    username, password = create_user(client.tracking_uri)
+    name = f"model-{random_str()}"
+    with User(ADMIN_USERNAME, ADMIN_PASSWORD, monkeypatch):
+        mlflow_client = MlflowClient(client.tracking_uri)
+        role = client.create_role(workspace=DEFAULT_WORKSPACE_NAME, name="cond")
+        client.add_role_permission(
+            role.id,
+            "registered_model",
+            "*",
+            "EDIT",
+            condition={"type": "alias_matches", "aliases": ["staging", "production-*"]},
+        )
+        client.assign_role(username, role.id)
+        mlflow_client.create_registered_model(name)
+        run = mlflow_client.create_run(mlflow_client.create_experiment(f"exp-{random_str()}"))
+        mlflow_client.create_model_version(
+            name, source=run.info.artifact_uri, run_id=run.info.run_id
+        )
+
+    def set_alias(alias):
+        return requests.post(
+            f"{client.tracking_uri}/api/2.0/mlflow/registered-models/alias",
+            json={"name": name, "alias": alias, "version": "1"},
+            auth=(username, password),
+            timeout=30,
+        ).status_code
+
+    assert set_alias("champion") == 403
+    assert set_alias("production") == 403
+    assert set_alias("staging") == 200
+    assert set_alias("production-eu") == 200

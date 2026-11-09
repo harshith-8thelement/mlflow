@@ -3,8 +3,12 @@
 # resolving permissions outside the store -- the precedence rules are the security-critical part and
 # they should be testable directly.
 
+import json
+from typing import NamedTuple
+
 import pytest
 
+from mlflow.server.auth.conditions import ConditionContext, serialize_condition
 from mlflow.server.auth.permissions import (
     DENY,
     EDIT,
@@ -14,6 +18,7 @@ from mlflow.server.auth.permissions import (
     RESOURCE_TYPE_ASSESSMENT,
     RESOURCE_TYPE_EXPERIMENT,
     RESOURCE_TYPE_GATEWAY_ENDPOINT,
+    RESOURCE_TYPE_REGISTERED_MODEL,
     RESOURCE_TYPE_RUN,
     RESOURCE_TYPE_SCORER,
     RESOURCE_TYPE_SCORER_VERSION,
@@ -508,3 +513,136 @@ def test_invoke_scorer_version_grant_does_not_rescue_a_scorer_deny():
         grant(RESOURCE_TYPE_SCORER_VERSION, "*", READ.name),
     ]
     assert decide(requirements, rows) is False
+
+
+# --------------------------------------------------------------- conditional grants
+
+
+class ConditionalGrant(NamedTuple):
+    resource_type: str
+    resource_pattern: str
+    permission: str
+    condition: str | None = None
+
+
+def _cond(**kwargs):
+    return serialize_condition(kwargs)
+
+
+MODEL_KEY = GrantLoadKey(RESOURCE_TYPE_REGISTERED_MODEL, "m")
+NOT_PROMOTED = _cond(type="tag_not_equals", key="promoted", value="true")
+PROMOTED = _cond(type="tag_equals", key="promoted", value="true")
+
+
+def _promotion_rows():
+    return [
+        ConditionalGrant(RESOURCE_TYPE_REGISTERED_MODEL, "*", EDIT.name, NOT_PROMOTED),
+        ConditionalGrant(RESOURCE_TYPE_REGISTERED_MODEL, "*", READ.name, PROMOTED),
+    ]
+
+
+def _tags_provider(tags):
+    return lambda _key: ConditionContext(tags=tags, alias=None)
+
+
+def test_a_grant_without_a_condition_attribute_or_with_none_is_unconditional():
+    rows = [
+        grant(RESOURCE_TYPE_REGISTERED_MODEL, "*", READ.name),
+        ConditionalGrant(RESOURCE_TYPE_REGISTERED_MODEL, "*", EDIT.name, None),
+    ]
+    assert fold_grants_for_key(rows, MODEL_KEY) == EDIT
+    assert fold_grants_for_key(rows, MODEL_KEY, _tags_provider({})) == EDIT
+
+
+def test_a_conditional_grant_is_skipped_without_a_context_provider():
+    assert fold_grants_for_key(_promotion_rows(), MODEL_KEY) is None
+
+
+def test_a_conditional_grant_applies_only_while_its_condition_holds():
+    rows = _promotion_rows()
+    assert fold_grants_for_key(rows, MODEL_KEY, _tags_provider({})) == EDIT
+    assert fold_grants_for_key(rows, MODEL_KEY, _tags_provider({"promoted": "true"})) == READ
+    assert fold_grants_for_key(rows, MODEL_KEY, _tags_provider({})) == EDIT
+
+
+def test_a_conditional_grant_is_silent_when_no_condition_holds():
+    rows = [ConditionalGrant(RESOURCE_TYPE_REGISTERED_MODEL, "*", EDIT.name, PROMOTED)]
+    assert fold_grants_for_key(rows, MODEL_KEY, _tags_provider({})) is None
+
+
+def test_a_conditional_deny_applies_only_while_its_condition_holds():
+    rows = [
+        grant(RESOURCE_TYPE_REGISTERED_MODEL, "*", EDIT.name),
+        ConditionalGrant(RESOURCE_TYPE_REGISTERED_MODEL, "*", DENY.name, PROMOTED),
+    ]
+    assert fold_grants_for_key(rows, MODEL_KEY, _tags_provider({})) == EDIT
+    assert fold_grants_for_key(rows, MODEL_KEY, _tags_provider({"promoted": "true"})) == DENY
+
+
+def test_deny_still_beats_a_higher_conditional_grant():
+    rows = [
+        grant(RESOURCE_TYPE_REGISTERED_MODEL, "*", DENY.name),
+        ConditionalGrant(RESOURCE_TYPE_REGISTERED_MODEL, "*", MANAGE.name, NOT_PROMOTED),
+    ]
+    assert fold_grants_for_key(rows, MODEL_KEY, _tags_provider({})) == DENY
+
+
+def test_the_context_is_computed_lazily_and_once():
+    calls = []
+
+    def provider(key):
+        calls.append(key)
+        return ConditionContext(tags={}, alias=None)
+
+    rows = _promotion_rows()
+    assert fold_grants_for_key(rows, MODEL_KEY, provider) == EDIT
+    assert calls == [MODEL_KEY]
+
+    calls.clear()
+    unconditional = [grant(RESOURCE_TYPE_REGISTERED_MODEL, "*", READ.name)]
+    fold_grants_for_key(unconditional, MODEL_KEY, provider)
+    assert calls == []
+
+    other_type = [ConditionalGrant(RESOURCE_TYPE_EXPERIMENT, "*", READ.name, PROMOTED)]
+    fold_grants_for_key(other_type, MODEL_KEY, provider)
+    assert calls == []
+
+
+def test_a_failing_context_provider_denies(caplog):
+    def provider(_key):
+        raise RuntimeError("store down")
+
+    rows = [
+        grant(RESOURCE_TYPE_REGISTERED_MODEL, "*", MANAGE.name),
+        ConditionalGrant(RESOURCE_TYPE_REGISTERED_MODEL, "*", READ.name, PROMOTED),
+    ]
+    with caplog.at_level("WARNING"):
+        assert fold_grants_for_key(rows, MODEL_KEY, provider) == DENY
+    assert "denying access" in caplog.text
+
+
+@pytest.mark.parametrize("bad", ["not json", json.dumps({"type": "nope"}), "[]"])
+def test_a_malformed_stored_condition_denies(bad):
+    rows = [
+        grant(RESOURCE_TYPE_REGISTERED_MODEL, "*", MANAGE.name),
+        ConditionalGrant(RESOURCE_TYPE_REGISTERED_MODEL, "*", READ.name, bad),
+    ]
+    assert fold_grants_for_key(rows, MODEL_KEY, _tags_provider({})) == DENY
+
+
+def test_an_alias_condition_applies_only_to_the_alias_in_the_context():
+    rows = [
+        ConditionalGrant(
+            RESOURCE_TYPE_REGISTERED_MODEL,
+            "*",
+            EDIT.name,
+            _cond(type="alias_matches", aliases=["production-*"]),
+        )
+    ]
+
+    def with_alias(alias):
+        return lambda _key: ConditionContext(tags={}, alias=alias)
+
+    assert fold_grants_for_key(rows, MODEL_KEY, with_alias("production-1")) == EDIT
+    assert fold_grants_for_key(rows, MODEL_KEY, with_alias("staging")) is None
+    assert fold_grants_for_key(rows, MODEL_KEY, with_alias(None)) is None

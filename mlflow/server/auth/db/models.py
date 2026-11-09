@@ -5,10 +5,12 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import declarative_base, relationship
 
+from mlflow.server.auth.conditions import parse_condition
 from mlflow.server.auth.entities import (
     Role,
     RolePermission,
@@ -82,9 +84,18 @@ class SqlRolePermission(Base):
     resource_type = Column(String(64), nullable=False)
     resource_pattern = Column(String(255), nullable=False)
     permission = Column(String(255), nullable=False)
+    # Canonical JSON (see conditions.serialize_condition); NULL means unconditioned.
+    condition_json = Column(Text, nullable=True)
+    # "" when there is no condition, else the SHA-256 of condition_json. Part of the unique
+    # key because NULLs never collide in a unique constraint.
+    condition_hash = Column(String(64), nullable=False, default="", server_default="")
     __table_args__ = (
         UniqueConstraint(
-            "role_id", "resource_type", "resource_pattern", name="unique_role_resource_perm"
+            "role_id",
+            "resource_type",
+            "resource_pattern",
+            "condition_hash",
+            name="unique_role_resource_perm_condition",
         ),
         Index("idx_role_permissions_role_id", "role_id"),
     )
@@ -96,6 +107,7 @@ class SqlRolePermission(Base):
             resource_type=self.resource_type,
             resource_pattern=self.resource_pattern,
             permission=self.permission,
+            condition=parse_condition(self.condition_json),
         )
 
 

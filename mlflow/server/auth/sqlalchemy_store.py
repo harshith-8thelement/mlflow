@@ -1,7 +1,7 @@
 import logging
 import re
 from collections.abc import Collection, Iterable
-from typing import NamedTuple
+from typing import Final, NamedTuple
 from urllib.parse import quote, unquote
 
 from sqlalchemy import and_, or_, select, text
@@ -16,6 +16,7 @@ from mlflow.protos.databricks_pb2 import (
     RESOURCE_ALREADY_EXISTS,
     RESOURCE_DOES_NOT_EXIST,
 )
+from mlflow.server.auth.conditions import condition_hash, serialize_condition, validate_condition
 from mlflow.server.auth.db import utils as dbutils
 from mlflow.server.auth.db.models import (
     SqlRole,
@@ -122,6 +123,11 @@ class RoleGrantRow(NamedTuple):
     resource_type: str
     resource_pattern: str
     permission: str
+    condition: str | None = None  # canonical JSON as stored
+
+
+# Distinguishes "leave the condition alone" from an explicit ``None`` (clear it).
+UNSET_CONDITION: Final = object()
 
 
 class NamedRoleGrant(NamedTuple):
@@ -2077,20 +2083,32 @@ class SqlAlchemyStore:
         resource_type: str,
         resource_pattern: str,
         permission: str,
+        condition: dict | None = None,
     ) -> RolePermission:
         _validate_permission_for_resource_type(permission, resource_type)
+        serialized_condition = None
+        if condition is not None:
+            serialized_condition = serialize_condition(
+                validate_condition(condition, resource_type)
+            )
         if resource_type == RESOURCE_TYPE_EXPERIMENT and resource_pattern != "*":
             resource_pattern = str(_parse_experiment_id(str(resource_pattern)))
         resource_pattern = self._validate_resource_pattern(resource_type, resource_pattern)
         _validate_resource_pattern(resource_pattern, resource_type)
         with self.ManagedSessionMaker(read_only=False) as session:
-            self._get_role(session, role_id)
+            role = self._get_role(session, role_id)
+            if serialized_condition is not None and self._is_synthetic_role_name(role.name):
+                raise MlflowException.invalid_parameter_value(
+                    "Conditions are not supported on per-user permission roles."
+                )
             try:
                 rp = SqlRolePermission(
                     role_id=role_id,
                     resource_type=resource_type,
                     resource_pattern=resource_pattern,
                     permission=permission,
+                    condition_json=serialized_condition,
+                    condition_hash=condition_hash(serialized_condition),
                 )
                 session.add(rp)
                 session.flush()
@@ -2098,7 +2116,8 @@ class SqlAlchemyStore:
             except IntegrityError as e:
                 raise MlflowException(
                     f"Role permission (role_id={role_id}, resource_type={resource_type}, "
-                    f"resource_pattern={resource_pattern}) already exists.",
+                    f"resource_pattern={resource_pattern}, condition={serialized_condition}) "
+                    "already exists.",
                     RESOURCE_ALREADY_EXISTS,
                 ) from e
 
@@ -2139,11 +2158,48 @@ class SqlAlchemyStore:
             )
             return [p.to_mlflow_entity() for p in perms]
 
-    def update_role_permission(self, role_permission_id: int, permission: str) -> RolePermission:
+    def update_role_permission(
+        self,
+        role_permission_id: int,
+        permission: str | None = None,
+        condition: "dict | None | object" = UNSET_CONDITION,
+    ) -> RolePermission:
+        if permission is None and condition is UNSET_CONDITION:
+            raise MlflowException.invalid_parameter_value(
+                "At least one of 'permission' or 'condition' must be provided."
+            )
         with self.ManagedSessionMaker(read_only=False) as session:
             rp = self._get_role_permission(session, role_permission_id)
-            _validate_permission_for_resource_type(permission, rp.resource_type)
-            rp.permission = permission
+            if permission is not None:
+                _validate_permission_for_resource_type(permission, rp.resource_type)
+            if condition is not UNSET_CONDITION:
+                if condition is None:
+                    rp.condition_json = None
+                    rp.condition_hash = ""
+                else:
+                    serialized = serialize_condition(
+                        validate_condition(condition, rp.resource_type)
+                    )
+                    if self._is_synthetic_role_name(self._get_role(session, rp.role_id).name):
+                        raise MlflowException.invalid_parameter_value(
+                            "Conditions are not supported on per-user permission roles."
+                        )
+                    rp.condition_json = serialized
+                    rp.condition_hash = condition_hash(serialized)
+            if permission is not None:
+                rp.permission = permission
+            # Read before flushing: a failed flush expires the instance.
+            role_id, resource_type = rp.role_id, rp.resource_type
+            resource_pattern, serialized_condition = rp.resource_pattern, rp.condition_json
+            try:
+                session.flush()
+            except IntegrityError as e:
+                raise MlflowException(
+                    f"Role permission (role_id={role_id}, resource_type={resource_type}, "
+                    f"resource_pattern={resource_pattern}, condition={serialized_condition}) "
+                    "already exists.",
+                    RESOURCE_ALREADY_EXISTS,
+                ) from e
             return rp.to_mlflow_entity()
 
     # ---- UserRoleAssignment CRUD ----
@@ -2288,6 +2344,10 @@ class SqlAlchemyStore:
             workspace_admin = False
             for role in roles:
                 for rp in role.permissions:
+                    # Conditions are evaluated by the request-time checks, not here;
+                    # skipping keeps this path from granting beyond a condition.
+                    if rp.condition_json is not None:
+                        continue
                     # (workspace, *) folds into resource-type queries only for
                     # MANAGE (workspace admin); USE is the "member can join +
                     # create" signal and folds only for workspace-tier queries.
@@ -2397,6 +2457,7 @@ class SqlAlchemyStore:
                     SqlRolePermission.resource_type,
                     SqlRolePermission.resource_pattern,
                     SqlRolePermission.permission,
+                    SqlRolePermission.condition_json,
                 )
                 .join(SqlRole, SqlRole.id == SqlRolePermission.role_id)
                 .join(SqlUserRoleAssignment, SqlRole.id == SqlUserRoleAssignment.role_id)
@@ -2407,7 +2468,7 @@ class SqlAlchemyStore:
                 )
                 .all()
             )
-            return [RoleGrantRow(rtype, pattern, permission) for rtype, pattern, permission in rows]
+            return [RoleGrantRow(*row) for row in rows]
 
     def list_role_grants_for_user_in_workspace(
         self, user_id: int, workspace: str, resource_type: str
