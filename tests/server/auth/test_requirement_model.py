@@ -3,8 +3,11 @@
 # resolving permissions outside the store -- the precedence rules are the security-critical part and
 # they should be testable directly.
 
+from typing import NamedTuple
+
 import pytest
 
+from mlflow.server.auth.conditions import ConditionContext
 from mlflow.server.auth.permissions import (
     DENY,
     EDIT,
@@ -14,6 +17,7 @@ from mlflow.server.auth.permissions import (
     RESOURCE_TYPE_ASSESSMENT,
     RESOURCE_TYPE_EXPERIMENT,
     RESOURCE_TYPE_GATEWAY_ENDPOINT,
+    RESOURCE_TYPE_REGISTERED_MODEL,
     RESOURCE_TYPE_RUN,
     RESOURCE_TYPE_SCORER,
     RESOURCE_TYPE_SCORER_VERSION,
@@ -508,3 +512,39 @@ def test_invoke_scorer_version_grant_does_not_rescue_a_scorer_deny():
         grant(RESOURCE_TYPE_SCORER_VERSION, "*", READ.name),
     ]
     assert decide(requirements, rows) is False
+
+
+# ------------------------------------------------ conditions in the fold
+
+
+def test_fold_without_a_context_keeps_unconditional_behaviour():
+    class _Row(NamedTuple):
+        resource_type: str
+        resource_pattern: str
+        permission: str
+        condition: str | None
+
+    key = GrantLoadKey(RESOURCE_TYPE_REGISTERED_MODEL, "m")
+    rows = [
+        _Row(RESOURCE_TYPE_REGISTERED_MODEL, "*", READ.name, None),
+        _Row(RESOURCE_TYPE_REGISTERED_MODEL, "m", EDIT.name, None),
+    ]
+    assert fold_grants_for_key(rows, key) == EDIT
+    assert fold_grants_for_key(rows, key, None) == EDIT
+
+
+def test_fold_skips_a_conditional_row_whose_condition_does_not_hold():
+    class _Row(NamedTuple):
+        resource_type: str
+        resource_pattern: str
+        permission: str
+        condition: str | None
+
+    key = GrantLoadKey(RESOURCE_TYPE_REGISTERED_MODEL, "m")
+    condition = '{"key":"promoted","type":"tag_not_equals","value":"true"}'
+    rows = [
+        _Row(RESOURCE_TYPE_REGISTERED_MODEL, "*", READ.name, None),
+        _Row(RESOURCE_TYPE_REGISTERED_MODEL, "*", EDIT.name, condition),
+    ]
+    assert fold_grants_for_key(rows, key, ConditionContext(tags={})) == EDIT
+    assert fold_grants_for_key(rows, key, ConditionContext(tags={"promoted": "true"})) == READ

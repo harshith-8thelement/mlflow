@@ -17,8 +17,15 @@ Two folds, and they are different operations:
   (tier override), so a ``DENY`` is never rescued by a more permissive ancestor.
 """
 
+import logging
 from typing import TYPE_CHECKING, NamedTuple
 
+from mlflow.server.auth.conditions import (
+    ConditionContext,
+    condition_holds,
+    is_alias_condition,
+    parse_condition,
+)
 from mlflow.server.auth.permissions import (
     DENY,
     MANAGE,
@@ -31,8 +38,10 @@ from mlflow.server.auth.permissions import (
     max_permission,
 )
 
+_logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
 
     from mlflow.server.auth.sqlalchemy_store import RoleGrantRow
 
@@ -144,20 +153,78 @@ def is_workspace_admin_grant(grant: "RoleGrantRow") -> bool:
     )
 
 
-def fold_grants_for_key(grants: "Sequence[RoleGrantRow]", key: GrantLoadKey) -> Permission | None:
-    # None means SILENT, not "no access": only the fold across keys knows whether a
-    # fallback key or the default should speak next.
-    denied = False
-    best: str | None = None
+def _applicable_grants(
+    grants: "Sequence[RoleGrantRow]", key: GrantLoadKey
+) -> "Iterator[RoleGrantRow]":
     for grant in grants:
         if grant.resource_type != key.resource_type:
             continue
         if not matches(grant.resource_pattern, key.resource_type, key.resource_id):
             continue
-        if grant.permission == DENY.name:
-            denied = True
-        else:
-            best = grant.permission if best is None else max_permission(best, grant.permission)
+        yield grant
+
+
+def fold_grants_for_key(
+    grants: "Sequence[RoleGrantRow]",
+    key: GrantLoadKey,
+    context: ConditionContext | None = None,
+) -> Permission | None:
+    # None means SILENT, not "no access": only the fold across keys knows whether a
+    # fallback key or the default should speak next.
+    #
+    # A row with a condition counts only while the condition holds for ``context``. Failing to
+    # evaluate one denies: a condition that cannot be read must never widen access.
+    denied = False
+    best: str | None = None
+    try:
+        for grant in _applicable_grants(grants, key):
+            is_deny = grant.permission == DENY.name
+            condition = getattr(grant, "condition", None)
+            if condition and not condition_holds(condition, context, is_deny=is_deny):
+                continue
+            if is_deny:
+                denied = True
+            else:
+                best = grant.permission if best is None else max_permission(best, grant.permission)
+    except Exception:
+        _logger.warning("Failed to evaluate a role permission condition; denying", exc_info=True)
+        return DENY
+    if denied:
+        return DENY
+    return get_permission(best) if best is not None else None
+
+
+def alias_scoped_permission(
+    grants: "Sequence[RoleGrantRow]",
+    key: GrantLoadKey,
+    context: ConditionContext | None,
+) -> Permission | None:
+    """The permission granted by ``alias_matches`` rows alone, for an alias set/delete.
+
+    Same matching as :func:`fold_grants_for_key`, restricted to alias-conditioned rows whose
+    condition holds. ``None`` when no such row applies (the caller then has no alias-scoped
+    say); a ``DENY`` among them wins; an evaluation failure denies.
+    """
+    denied = False
+    best: str | None = None
+    try:
+        for grant in _applicable_grants(grants, key):
+            condition = getattr(grant, "condition", None)
+            if not condition or not is_alias_condition(condition):
+                # A condition that is not even readable cannot be ruled out as alias-scoped.
+                if condition:
+                    parse_condition(condition)
+                continue
+            is_deny = grant.permission == DENY.name
+            if not condition_holds(condition, context, is_deny=is_deny):
+                continue
+            if is_deny:
+                denied = True
+            else:
+                best = grant.permission if best is None else max_permission(best, grant.permission)
+    except Exception:
+        _logger.warning("Failed to evaluate a role permission condition; denying", exc_info=True)
+        return DENY
     if denied:
         return DENY
     return get_permission(best) if best is not None else None

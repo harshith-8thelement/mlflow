@@ -12,9 +12,18 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from mlflow.environment_variables import MLFLOW_ENABLE_WORKSPACES
 from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import (
+    INVALID_PARAMETER_VALUE,
     INVALID_STATE,
     RESOURCE_ALREADY_EXISTS,
     RESOURCE_DOES_NOT_EXIST,
+)
+from mlflow.server.auth.conditions import (
+    UNSET_CONDITION,
+    ConditionEvaluationError,
+    condition_holds,
+    condition_key,
+    serialize_condition,
+    validate_condition,
 )
 from mlflow.server.auth.db import utils as dbutils
 from mlflow.server.auth.db.models import (
@@ -122,6 +131,8 @@ class RoleGrantRow(NamedTuple):
     resource_type: str
     resource_pattern: str
     permission: str
+    # Canonical serialized JSON; None for an unconditional grant.
+    condition: str | None = None
 
 
 class NamedRoleGrant(NamedTuple):
@@ -2077,20 +2088,30 @@ class SqlAlchemyStore:
         resource_type: str,
         resource_pattern: str,
         permission: str,
+        condition: dict | None = None,
     ) -> RolePermission:
         _validate_permission_for_resource_type(permission, resource_type)
+        condition = validate_condition(condition, resource_type)
+        serialized_condition = serialize_condition(condition)
         if resource_type == RESOURCE_TYPE_EXPERIMENT and resource_pattern != "*":
             resource_pattern = str(_parse_experiment_id(str(resource_pattern)))
         resource_pattern = self._validate_resource_pattern(resource_type, resource_pattern)
         _validate_resource_pattern(resource_pattern, resource_type)
         with self.ManagedSessionMaker(read_only=False) as session:
-            self._get_role(session, role_id)
+            role = self._get_role(session, role_id)
+            if condition is not None and self._is_synthetic_role_name(role.name):
+                raise MlflowException(
+                    "Conditions are not supported on per-user permissions.",
+                    INVALID_PARAMETER_VALUE,
+                )
             try:
                 rp = SqlRolePermission(
                     role_id=role_id,
                     resource_type=resource_type,
                     resource_pattern=resource_pattern,
                     permission=permission,
+                    condition=serialized_condition,
+                    condition_key=condition_key(serialized_condition),
                 )
                 session.add(rp)
                 session.flush()
@@ -2098,7 +2119,8 @@ class SqlAlchemyStore:
             except IntegrityError as e:
                 raise MlflowException(
                     f"Role permission (role_id={role_id}, resource_type={resource_type}, "
-                    f"resource_pattern={resource_pattern}) already exists.",
+                    f"resource_pattern={resource_pattern}, condition={condition}) "
+                    "already exists.",
                     RESOURCE_ALREADY_EXISTS,
                 ) from e
 
@@ -2139,11 +2161,55 @@ class SqlAlchemyStore:
             )
             return [p.to_mlflow_entity() for p in perms]
 
-    def update_role_permission(self, role_permission_id: int, permission: str) -> RolePermission:
+    def update_role_permission(
+        self,
+        role_permission_id: int,
+        permission: str | None = None,
+        condition: dict | None = UNSET_CONDITION,
+    ) -> RolePermission:
+        """
+        Update a role permission's level and/or condition. ``condition=None`` clears the
+        condition; leaving it unset keeps the current one.
+        """
+        if permission is None and condition is UNSET_CONDITION:
+            raise MlflowException(
+                "At least one of 'permission' or 'condition' must be provided.",
+                INVALID_PARAMETER_VALUE,
+            )
         with self.ManagedSessionMaker(read_only=False) as session:
             rp = self._get_role_permission(session, role_permission_id)
-            _validate_permission_for_resource_type(permission, rp.resource_type)
-            rp.permission = permission
+            if permission is not None:
+                _validate_permission_for_resource_type(permission, rp.resource_type)
+            if condition is not UNSET_CONDITION:
+                condition = validate_condition(condition, rp.resource_type)
+                if condition is not None:
+                    role = self._get_role(session, rp.role_id)
+                    if self._is_synthetic_role_name(role.name):
+                        raise MlflowException(
+                            "Conditions are not supported on per-user permissions.",
+                            INVALID_PARAMETER_VALUE,
+                        )
+            # Read before the flush: after an IntegrityError the session is rolled back.
+            role_id, resource_type, resource_pattern = (
+                rp.role_id,
+                rp.resource_type,
+                rp.resource_pattern,
+            )
+            try:
+                if permission is not None:
+                    rp.permission = permission
+                if condition is not UNSET_CONDITION:
+                    serialized_condition = serialize_condition(condition)
+                    rp.condition = serialized_condition
+                    rp.condition_key = condition_key(serialized_condition)
+                session.flush()
+            except IntegrityError as e:
+                raise MlflowException(
+                    f"Role permission (role_id={role_id}, resource_type={resource_type}, "
+                    f"resource_pattern={resource_pattern}, condition={condition}) "
+                    "already exists.",
+                    RESOURCE_ALREADY_EXISTS,
+                ) from e
             return rp.to_mlflow_entity()
 
     # ---- UserRoleAssignment CRUD ----
@@ -2304,6 +2370,18 @@ class SqlAlchemyStore:
                     if rp.resource_type != resource_type:
                         continue
                     if matches(rp.resource_pattern, resource_type, resource_id):
+                        if rp.condition is not None:
+                            # No request context here: tag conditions are unknown, so only a
+                            # DENY row can apply; an unevaluable condition denies.
+                            try:
+                                holds = condition_holds(
+                                    rp.condition, None, is_deny=rp.permission == DENY.name
+                                )
+                            except ConditionEvaluationError:
+                                denied = True
+                                continue
+                            if not holds:
+                                continue
                         # DENY is below every positive level, so folding it with
                         # ``max_permission`` would silently lift it to the positive grant
                         # beside it. Track it separately, as ``fold_grants_for_key`` does.
@@ -2397,6 +2475,7 @@ class SqlAlchemyStore:
                     SqlRolePermission.resource_type,
                     SqlRolePermission.resource_pattern,
                     SqlRolePermission.permission,
+                    SqlRolePermission.condition,
                 )
                 .join(SqlRole, SqlRole.id == SqlRolePermission.role_id)
                 .join(SqlUserRoleAssignment, SqlRole.id == SqlUserRoleAssignment.role_id)
@@ -2407,7 +2486,10 @@ class SqlAlchemyStore:
                 )
                 .all()
             )
-            return [RoleGrantRow(rtype, pattern, permission) for rtype, pattern, permission in rows]
+            return [
+                RoleGrantRow(rtype, pattern, permission, condition)
+                for rtype, pattern, permission, condition in rows
+            ]
 
     def list_role_grants_for_user_in_workspace(
         self, user_id: int, workspace: str, resource_type: str
@@ -2426,7 +2508,11 @@ class SqlAlchemyStore:
         with self.ManagedSessionMaker() as session:
             rows = (
                 session
-                .query(SqlRolePermission.resource_pattern, SqlRolePermission.permission)
+                .query(
+                    SqlRolePermission.resource_pattern,
+                    SqlRolePermission.permission,
+                    SqlRolePermission.condition,
+                )
                 .join(SqlRole, SqlRole.id == SqlRolePermission.role_id)
                 .join(SqlUserRoleAssignment, SqlRole.id == SqlUserRoleAssignment.role_id)
                 .filter(
@@ -2443,7 +2529,13 @@ class SqlAlchemyStore:
                 )
                 .all()
             )
-            return [(pattern, permission) for pattern, permission in rows]
+            # A positive conditional grant cannot be judged without a resource, so it is dropped
+            # (never over-grants); a conditional DENY is kept (never under-denies).
+            return [
+                (pattern, permission)
+                for pattern, permission, condition in rows
+                if condition is None or permission == DENY.name
+            ]
 
     def list_workspace_admin_workspaces(self, user_id: int) -> set[str]:
         """
