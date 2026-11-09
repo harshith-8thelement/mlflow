@@ -36,6 +36,7 @@ from mlflow.environment_variables import (
 # ALl of the mlflow dependencies below need to be backwards compatible.
 from mlflow.exceptions import MlflowException
 from mlflow.pyfunc.model import _log_warning_if_params_not_in_predict_signature
+from mlflow.pyfunc.scoring_server.prometheus_metrics import setup_prometheus_metrics
 from mlflow.types import ParamSchema, Schema
 from mlflow.utils import reraise
 from mlflow.utils.file_utils import path_to_local_file_uri
@@ -461,6 +462,8 @@ def init(model: PyFuncModel):
                 status_code=504,
                 media_type="application/json",
             )
+
+    setup_prometheus_metrics(app)
 
     async def ping():
         """
