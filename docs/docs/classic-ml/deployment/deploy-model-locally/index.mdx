@@ -54,6 +54,43 @@ The inference server provides 4 endpoints:
 
 - `/version`: Returns the MLflow version.
 
+### Prometheus Metrics
+
+The inference server can optionally expose Prometheus metrics. This is disabled by default. To enable it, set the
+`prometheus_multiproc_dir` environment variable (the same variable used by the tracking server) to a dedicated,
+empty directory before starting the server:
+
+```bash
+mkdir -p /path/to/empty/dir
+prometheus_multiproc_dir=/path/to/empty/dir mlflow models serve -m runs:/<run_id>/model -p 5000
+```
+
+This adds a `GET /metrics` endpoint that returns metrics in the Prometheus text format. When the variable is unset,
+there is no `/metrics` endpoint and no metrics are collected.
+
+The following metrics are exposed:
+
+- `mlflow_scoring_server_http_request_total`: Counter of requests, labelled by `path` and `status` (HTTP status code).
+- `mlflow_scoring_server_http_request_duration_seconds`: Histogram of request latency, labelled by `path`.
+
+The `path` label is limited to the server's endpoints; requests to any other path are recorded as `other`. Request
+content and model inputs are never used as labels.
+
+Metrics are aggregated across all server workers, so a single scrape of `/metrics` reflects the requests handled by
+every worker.
+
+:::note
+The `prometheus_client` package must be installed in the environment that runs the server, for example with
+`pip install prometheus-client` or `pip install mlflow[extras]`. This includes the model environment created for the
+`conda` and `virtualenv` environment managers, and Docker images built with `mlflow models build-docker`. If the package
+is missing, the server logs a warning, metrics are disabled, and `/metrics` returns 404.
+:::
+
+:::warning
+Use a dedicated, empty directory for each server. Metric files left by dead workers or previous runs are not cleaned
+up beyond what `prometheus_client` does itself, so wipe the directory between restarts to avoid stale values.
+:::
+
 ### Accepted Input Formats
 
 The `/invocations` endpoint accepts CSV or JSON inputs. The input format must be specified in the
