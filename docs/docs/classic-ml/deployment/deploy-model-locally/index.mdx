@@ -44,7 +44,7 @@ to the <APILink fn="mlflow.server.cli" hash="mlflow-models">MLflow CLI Reference
 
 ### Endpoints
 
-The inference server provides 4 endpoints:
+The inference server provides 4 endpoints, plus an optional fifth endpoint for Prometheus metrics:
 
 - `/invocations`: An inference endpoint that accepts POST requests with input data and returns predictions.
 
@@ -53,6 +53,45 @@ The inference server provides 4 endpoints:
 - `/health`: Same as /ping
 
 - `/version`: Returns the MLflow version.
+
+- `/metrics` (optional): Exposes Prometheus metrics. Only available when `prometheus_multiproc_dir` is set. See [Prometheus metrics](#prometheus-metrics).
+
+### Prometheus metrics \{#prometheus-metrics}
+
+The inference server can optionally expose Prometheus metrics. This is disabled by default; when it is disabled,
+there is no `/metrics` route (requests to it return 404) and no metrics code runs. To enable it, set the
+`prometheus_multiproc_dir` environment variable (the same variable used by `mlflow server --expose-prometheus`)
+before starting the server:
+
+```bash
+export prometheus_multiproc_dir=/tmp/mlflow-serving-metrics
+mlflow models serve -m runs:/<run_id>/model
+```
+
+Metrics are then available with `GET /metrics` in the Prometheus text format. The following metrics are recorded:
+
+- `mlflow_scoring_server_http_request_total{path,status}`: A counter of requests, labelled by path and HTTP status code.
+- `mlflow_scoring_server_http_request_duration_seconds{path}`: A histogram of request latency in seconds, labelled by path.
+
+The `path` label is either `/invocations` or `other`. Requests to any other path are all counted under `other`, so the
+number of label values stays bounded. Requests to `/ping`, `/health`, `/version` and `/metrics` are not counted. Both
+metrics appear from the first scrape, with zero values before any request has been handled. Requests that hit the
+scoring timeout are recorded with status `504`.
+
+Metrics are aggregated across processes, so when the server runs with multiple uvicorn workers, a single scrape of
+`/metrics` includes the requests handled by every worker.
+
+A few things to keep in mind:
+
+- This feature requires the `prometheus-client` package (for example, installed with `mlflow[extras]`). If it is not
+  installed, the server logs a warning, keeps serving models normally, and metrics stay disabled.
+- The directory is created if it does not exist. It should be emptied between server restarts, because the metric
+  files in it persist across restarts.
+- Metric files left by dead or restarted workers are not cleaned up beyond what `prometheus_client` does, so the counts
+  from those workers remain in the totals.
+- `/metrics` is unauthenticated, like the other endpoints. Restrict access to it at the network level.
+- In Docker images built with `mlflow models build-docker`, the bundled nginx proxies only `/ping` and `/invocations`,
+  so `/metrics` is reachable only when the container is run with `DISABLE_NGINX=true`.
 
 ### Accepted Input Formats
 
