@@ -2,6 +2,7 @@ import sqlite3
 from pathlib import Path
 from urllib.parse import quote
 
+import pytest
 from alembic.command import downgrade as alembic_downgrade
 from click.testing import CliRunner
 
@@ -145,7 +146,7 @@ def test_upgrade_from_legacy_database(tmp_path: Path) -> None:
     assert "scorer_permissions" in tables
     assert "registered_model_permissions" in tables
     assert "workspace_permissions" in tables
-    assert version[0] == "f1a2b3c4d5e6"
+    assert version[0] == "a7c9e1b3d5f2"
     assert user == ("testuser", 1)
 
 
@@ -754,3 +755,154 @@ def test_promote_prompt_resource_type_downgrade_collapses_to_registered_model(
         cursor.execute("SELECT resource_type, resource_pattern FROM role_permissions")
         rows = cursor.fetchall()
     assert rows == [("registered_model", "prompt-foo")]
+
+
+_CONDITIONS_REVISION = "a7c9e1b3d5f2"
+_PRE_CONDITIONS_REVISION = "f1a2b3c4d5e6"
+
+
+def _seed_role_with_permissions(db: Path, rows: list[tuple[str, str, str]]) -> None:
+    with sqlite3.connect(db) as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO roles (id, workspace, name) VALUES (1, 'default', 'editor')")
+        cursor.executemany(
+            "INSERT INTO role_permissions "
+            "(role_id, resource_type, resource_pattern, permission) VALUES (1, ?, ?, ?)",
+            rows,
+        )
+        conn.commit()
+
+
+def _role_permission_unique_constraints(db: Path) -> set[str]:
+    import sqlalchemy
+
+    engine = sqlalchemy.create_engine(f"sqlite:///{db}")
+    try:
+        inspector = sqlalchemy.inspect(engine)
+        return {c["name"] for c in inspector.get_unique_constraints("role_permissions")}
+    finally:
+        engine.dispose()
+
+
+def test_role_permission_conditions_upgrade_preserves_rows(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db = tmp_path / "test.db"
+    db_url = f"sqlite:///{db}"
+    res = runner.invoke(
+        cli.upgrade,
+        ["--url", db_url, "--revision", _PRE_CONDITIONS_REVISION],
+        catch_exceptions=False,
+    )
+    assert res.exit_code == 0, res.output
+    seeded = [
+        ("registered_model", "*", "EDIT"),
+        ("registered_model", "model-a", "READ"),
+        ("experiment", "1", "MANAGE"),
+    ]
+    _seed_role_with_permissions(db, seeded)
+
+    res = runner.invoke(cli.upgrade, ["--url", db_url], catch_exceptions=False)
+    assert res.exit_code == 0, res.output
+
+    with sqlite3.connect(db) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT resource_type, resource_pattern, permission, condition_json, condition_hash "
+            "FROM role_permissions ORDER BY id"
+        )
+        rows = cursor.fetchall()
+        cursor.execute("SELECT version_num FROM alembic_version_auth")
+        assert cursor.fetchone() == (_CONDITIONS_REVISION,)
+        # The role_id index survives the table rebuild.
+        cursor.execute("PRAGMA index_list(role_permissions)")
+        index_names = {r[1] for r in cursor.fetchall()}
+
+    assert rows == [(*row, None, "") for row in seeded]
+    assert "idx_role_permissions_role_id" in index_names
+    constraints = _role_permission_unique_constraints(db)
+    assert "unique_role_resource_perm_condition" in constraints
+    assert "unique_role_resource_perm" not in constraints
+
+
+def test_role_permission_conditions_upgraded_schema_allows_condition_variants(
+    tmp_path: Path,
+) -> None:
+    runner = CliRunner()
+    db = tmp_path / "test.db"
+    res = runner.invoke(cli.upgrade, ["--url", f"sqlite:///{db}"], catch_exceptions=False)
+    assert res.exit_code == 0, res.output
+    _seed_role_with_permissions(db, [("registered_model", "*", "EDIT")])
+
+    insert = (
+        "INSERT INTO role_permissions "
+        "(role_id, resource_type, resource_pattern, permission, condition_json, condition_hash) "
+        "VALUES (1, 'registered_model', '*', 'READ', ?, ?)"
+    )
+    with sqlite3.connect(db) as conn:
+        conn.execute(insert, ('{"a":1}', "hash-1"))
+        conn.commit()
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            conn.execute(insert, ('{"a":1}', "hash-1"))
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            conn.execute(insert, (None, ""))
+
+
+def test_role_permission_conditions_downgrade_without_conditions_round_trips(
+    tmp_path: Path,
+) -> None:
+    runner = CliRunner()
+    db = tmp_path / "test.db"
+    db_url = f"sqlite:///{db}"
+    res = runner.invoke(cli.upgrade, ["--url", db_url], catch_exceptions=False)
+    assert res.exit_code == 0, res.output
+    _seed_role_with_permissions(
+        db, [("registered_model", "*", "EDIT"), ("registered_model", "m", "READ")]
+    )
+
+    _alembic_downgrade(db_url, _PRE_CONDITIONS_REVISION)
+
+    with sqlite3.connect(db) as conn:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(role_permissions)")
+        columns = {r[1] for r in cursor.fetchall()}
+        cursor.execute(
+            "SELECT resource_type, resource_pattern, permission FROM role_permissions ORDER BY id"
+        )
+        rows = cursor.fetchall()
+    assert columns == {"id", "role_id", "resource_type", "resource_pattern", "permission"}
+    assert rows == [("registered_model", "*", "EDIT"), ("registered_model", "m", "READ")]
+    constraints = _role_permission_unique_constraints(db)
+    assert "unique_role_resource_perm" in constraints
+    assert "unique_role_resource_perm_condition" not in constraints
+
+    res = runner.invoke(cli.upgrade, ["--url", db_url], catch_exceptions=False)
+    assert res.exit_code == 0, res.output
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM role_permissions").fetchone() == (2,)
+
+
+def test_role_permission_conditions_downgrade_refuses_when_conditions_exist(
+    tmp_path: Path,
+) -> None:
+    runner = CliRunner()
+    db = tmp_path / "test.db"
+    db_url = f"sqlite:///{db}"
+    res = runner.invoke(cli.upgrade, ["--url", db_url], catch_exceptions=False)
+    assert res.exit_code == 0, res.output
+    _seed_role_with_permissions(db, [("registered_model", "*", "EDIT")])
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO role_permissions (id, role_id, resource_type, resource_pattern, "
+            "permission, condition_json, condition_hash) "
+            "VALUES (42, 1, 'registered_model', '*', 'READ', '{}', 'h')"
+        )
+        conn.commit()
+
+    with pytest.raises(RuntimeError, match=r"ids: 42\)"):
+        _alembic_downgrade(db_url, _PRE_CONDITIONS_REVISION)
+
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM role_permissions").fetchone() == (2,)
+        assert conn.execute("SELECT version_num FROM alembic_version_auth").fetchone() == (
+            _CONDITIONS_REVISION,
+        )

@@ -31,6 +31,9 @@ from mlflow.server.auth.routes import (
 from mlflow.utils.credentials import get_default_host_creds
 from mlflow.utils.rest_utils import http_request, verify_rest_response
 
+# Local sentinel: distinguishes "leave the condition alone" from ``None`` (clear it).
+_UNSET: object = object()
+
 
 class AuthServiceClient:
     """
@@ -290,7 +293,12 @@ class AuthServiceClient:
         self._request(DELETE_ROLE, "DELETE", json={"role_id": role_id})
 
     def add_role_permission(
-        self, role_id: int, resource_type: str, resource_pattern: str, permission: str
+        self,
+        role_id: int,
+        resource_type: str,
+        resource_pattern: str,
+        permission: str,
+        condition: dict | None = None,
     ) -> RolePermission:
         """Grant ``permission`` on resources of ``resource_type`` matching ``resource_pattern``.
 
@@ -310,20 +318,33 @@ class AuthServiceClient:
                 explicit-deny override that wins over any positive grant it is folded with, and
                 applies at the tier it is granted on. ``workspace`` accepts only ``USE`` and
                 ``MANAGE``.
+            condition: Optional condition limiting when the permission applies. Supported only
+                when ``resource_type`` is ``registered_model``; a condition on any other type is
+                rejected. One of:
+
+                - ``{"type": "tag_equals", "key": "<tag>", "value": "<value>"}``: applies when the
+                  model's tag ``key`` equals ``value``.
+                - ``{"type": "tag_not_equals", "key": "<tag>", "value": "<value>"}``: applies when
+                  the model's tag ``key`` is absent or differs from ``value``.
+                - ``{"type": "alias_matches", "aliases": ["staging", "production-*"]}``: applies
+                  to set/delete-alias requests whose alias name matches one of the names or glob
+                  patterns.
+
+                A malformed or unknown condition raises an :py:class:`MlflowException` with
+                ``INVALID_PARAMETER_VALUE``.
 
         Returns:
             The created :py:class:`RolePermission`.
         """
-        resp = self._request(
-            ADD_ROLE_PERMISSION,
-            "POST",
-            json={
-                "role_id": role_id,
-                "resource_type": resource_type,
-                "resource_pattern": resource_pattern,
-                "permission": permission,
-            },
-        )
+        payload = {
+            "role_id": role_id,
+            "resource_type": resource_type,
+            "resource_pattern": resource_pattern,
+            "permission": permission,
+        }
+        if condition is not None:
+            payload["condition"] = condition
+        resp = self._request(ADD_ROLE_PERMISSION, "POST", json=payload)
         return RolePermission.from_json(resp["role_permission"])
 
     def remove_role_permission(self, role_permission_id: int) -> None:
@@ -335,12 +356,33 @@ class AuthServiceClient:
         resp = self._request(LIST_ROLE_PERMISSIONS, "GET", params={"role_id": str(role_id)})
         return [RolePermission.from_json(p) for p in resp["role_permissions"]]
 
-    def update_role_permission(self, role_permission_id: int, permission: str) -> RolePermission:
-        resp = self._request(
-            UPDATE_ROLE_PERMISSION,
-            "PATCH",
-            json={"role_permission_id": role_permission_id, "permission": permission},
-        )
+    def update_role_permission(
+        self,
+        role_permission_id: int,
+        permission: str | None = None,
+        *,
+        condition: "dict | None | object" = _UNSET,
+    ) -> RolePermission:
+        """Update the permission level and/or the condition of a role permission.
+
+        Args:
+            role_permission_id: The role permission to update.
+            permission: New permission level; left unchanged if ``None``.
+            condition: New condition, with the shapes documented on :py:meth:`add_role_permission`
+                (``tag_equals``, ``tag_not_equals``, ``alias_matches``). Conditions are supported
+                only on ``registered_model`` permissions. Pass ``None`` to clear the condition;
+                omit the argument to leave it unchanged. At least one of ``permission`` and
+                ``condition`` must be given.
+
+        Returns:
+            The updated :py:class:`RolePermission`.
+        """
+        payload = {"role_permission_id": role_permission_id}
+        if permission is not None:
+            payload["permission"] = permission
+        if condition is not _UNSET:
+            payload["condition"] = condition
+        resp = self._request(UPDATE_ROLE_PERMISSION, "PATCH", json=payload)
         return RolePermission.from_json(resp["role_permission"])
 
     def assign_role(self, username: str, role_id: int) -> UserRoleAssignment:

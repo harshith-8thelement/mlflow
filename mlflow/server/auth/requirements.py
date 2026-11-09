@@ -17,8 +17,10 @@ Two folds, and they are different operations:
   (tier override), so a ``DENY`` is never rescued by a more permissive ancestor.
 """
 
+import logging
 from typing import TYPE_CHECKING, NamedTuple
 
+from mlflow.server.auth.conditions import ConditionContext, condition_holds
 from mlflow.server.auth.permissions import (
     DENY,
     MANAGE,
@@ -32,9 +34,11 @@ from mlflow.server.auth.permissions import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from mlflow.server.auth.sqlalchemy_store import RoleGrantRow
+
+_logger = logging.getLogger(__name__)
 
 # A veto-only requirement: the key must not be denied, and nothing positive is required of
 # it. Not one of the standard action verbs -- that catalogue has no veto -- so it is a local
@@ -144,16 +148,43 @@ def is_workspace_admin_grant(grant: "RoleGrantRow") -> bool:
     )
 
 
-def fold_grants_for_key(grants: "Sequence[RoleGrantRow]", key: GrantLoadKey) -> Permission | None:
+def fold_grants_for_key(
+    grants: "Sequence[RoleGrantRow]",
+    key: GrantLoadKey,
+    condition_context: "Callable[[GrantLoadKey], ConditionContext] | None" = None,
+) -> Permission | None:
     # None means SILENT, not "no access": only the fold across keys knows whether a
     # fallback key or the default should speak next.
+    #
+    # A conditional grant applies only while its condition holds. Without a context provider
+    # it is skipped. Any failure to build the context or evaluate the condition counts as a
+    # DENY (fail closed), so a broken condition can never widen access.
     denied = False
     best: str | None = None
+    context: ConditionContext | None = None
     for grant in grants:
         if grant.resource_type != key.resource_type:
             continue
         if not matches(grant.resource_pattern, key.resource_type, key.resource_id):
             continue
+        condition = getattr(grant, "condition", None)
+        if condition is not None:
+            if condition_context is None:
+                continue
+            try:
+                if context is None:
+                    context = condition_context(key)
+                if not condition_holds(condition, context):
+                    continue
+            except Exception:
+                _logger.warning(
+                    "Failed to evaluate a role permission condition on %s %r; denying access.",
+                    key.resource_type,
+                    key.resource_id,
+                    exc_info=True,
+                )
+                denied = True
+                continue
         if grant.permission == DENY.name:
             denied = True
         else:
