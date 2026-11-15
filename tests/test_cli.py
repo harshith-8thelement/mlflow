@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -1477,6 +1478,68 @@ def test_cli_with_python_mod():
 def test_doctor():
     res = CliRunner().invoke(doctor, catch_exceptions=False)
     assert res.exit_code == 0
+
+
+def test_doctor_json():
+    res = CliRunner().invoke(doctor, ["--json"], catch_exceptions=False)
+    assert res.exit_code == 0
+    info = json.loads(res.stdout)
+    for key in (
+        "System information",
+        "Python version",
+        "MLflow version",
+        "MLflow module location",
+        "Tracking URI",
+        "Registry URI",
+        "MLflow dependencies",
+    ):
+        assert key in info
+    assert info["MLflow version"] == mlflow.__version__
+    assert isinstance(info["MLflow dependencies"], dict)
+
+
+def test_doctor_json_env_vars(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MLFLOW_TEST_DOCTOR", "value")
+    res = CliRunner().invoke(doctor, ["--json"], catch_exceptions=False)
+    assert res.exit_code == 0
+    assert json.loads(res.stdout)["MLflow environment variables"]["MLFLOW_TEST_DOCTOR"] == "value"
+
+
+def test_doctor_json_mask_envs(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MLFLOW_TEST_DOCTOR", "value")
+    res = CliRunner().invoke(doctor, ["--json", "--mask-envs"], catch_exceptions=False)
+    assert res.exit_code == 0
+    envs = json.loads(res.stdout)["MLflow environment variables"]
+    assert "MLFLOW_TEST_DOCTOR" in envs
+    assert set(envs.values()) == {"***"}
+
+
+def test_doctor_json_optional_fields():
+    with (
+        mlflow.start_run() as run,
+        mock.patch("mlflow.utils.doctor.get_databricks_runtime_version", return_value="12.0"),
+    ):
+        res = CliRunner().invoke(doctor, ["--json"], catch_exceptions=False)
+    assert res.exit_code == 0
+    info = json.loads(res.stdout)
+    assert info["Databricks runtime version"] == "12.0"
+    assert info["Active run ID"] == run.info.run_id
+    assert info["Active experiment ID"] == run.info.experiment_id
+    assert info["Active run artifact URI"] == run.info.artifact_uri
+
+
+def test_doctor_text_output_unchanged(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MLFLOW_TEST_DOCTOR", "value")
+    res = CliRunner().invoke(doctor, catch_exceptions=False)
+    assert res.exit_code == 0
+    assert "MLflow version: " in res.stdout
+    assert "MLFLOW_TEST_DOCTOR: value" in res.stdout
+    with pytest.raises(json.JSONDecodeError, match="Expecting value"):
+        json.loads(res.stdout)
+
+    res = CliRunner().invoke(doctor, ["--mask-envs"], catch_exceptions=False)
+    assert res.exit_code == 0
+    assert "MLFLOW_TEST_DOCTOR: ***" in res.stdout
 
 
 def test_env_file_loading(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
