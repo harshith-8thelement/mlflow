@@ -49,6 +49,7 @@ from mlflow.tracking._tracking_service.utils import (
 )
 from mlflow.tracking._workspace.registry import get_workspace_store
 from mlflow.utils import cli_args, workspace_context
+from mlflow.utils.doctor import _get_doctor_info
 from mlflow.utils.logging_utils import eprint
 from mlflow.utils.os import is_windows
 from mlflow.utils.plugins import get_entry_points
@@ -1366,8 +1367,17 @@ def gc(
         "in the output to prevent leaking sensitive information."
     ),
 )
-def doctor(mask_envs):
-    mlflow.doctor(mask_envs)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="If set, print the debug information as a single JSON object.",
+)
+def doctor(mask_envs, json_output):
+    if json_output:
+        click.echo(json.dumps(_get_doctor_info(mask_envs), indent=2))
+    else:
+        mlflow.doctor(mask_envs)
 
 
 cli.add_command(mlflow.deployments.cli.commands)

@@ -1,5 +1,6 @@
 import os
 import platform
+from typing import Any
 
 import click
 import importlib_metadata
@@ -8,6 +9,50 @@ from packaging.requirements import Requirement
 
 import mlflow
 from mlflow.utils.databricks_utils import get_databricks_runtime_version
+
+
+def _get_doctor_info(mask_envs: bool = False) -> dict[str, Any]:
+    """Collect the doctor debug info as an insertion-ordered dict."""
+    info = {
+        "System information": " ".join((platform.system(), platform.version())),
+        "Python version": platform.python_version(),
+        "MLflow version": mlflow.__version__,
+        "MLflow module location": mlflow.__file__,
+        "Tracking URI": mlflow.get_tracking_uri(),
+        "Registry URI": mlflow.get_registry_uri(),
+    }
+
+    if (runtime := get_databricks_runtime_version()) is not None:
+        info["Databricks runtime version"] = runtime
+
+    if active_run := mlflow.active_run():
+        info["Active experiment ID"] = active_run.info.experiment_id
+        info["Active run ID"] = active_run.info.run_id
+        info["Active run artifact URI"] = active_run.info.artifact_uri
+
+    mlflow_envs = {
+        k: ("***" if mask_envs else v) for k, v in os.environ.items() if k.startswith("MLFLOW_")
+    }
+    if mlflow_envs:
+        info["MLflow environment variables"] = mlflow_envs
+
+    try:
+        requires = importlib_metadata.requires("mlflow")
+    except importlib_metadata.PackageNotFoundError:
+        requires = importlib_metadata.requires("mlflow-skinny")
+
+    mlflow_dependencies = {}
+    for req in requires:
+        req = Requirement(req)
+        try:
+            dist = importlib_metadata.distribution(req.name)
+        except importlib_metadata.PackageNotFoundError:
+            continue
+        else:
+            mlflow_dependencies[req.name] = dist.version
+
+    info["MLflow dependencies"] = mlflow_dependencies
+    return info
 
 
 def doctor(mask_envs=False):
@@ -71,53 +116,8 @@ def doctor(mask_envs=False):
           sqlalchemy: 1.4.42
           sqlparse: 0.4.3
     """
-    items = [
-        ("System information", " ".join((platform.system(), platform.version()))),
-        ("Python version", platform.python_version()),
-        ("MLflow version", mlflow.__version__),
-        ("MLflow module location", mlflow.__file__),
-        ("Tracking URI", mlflow.get_tracking_uri()),
-        ("Registry URI", mlflow.get_registry_uri()),
-    ]
-
-    if (runtime := get_databricks_runtime_version()) is not None:
-        items.append(("Databricks runtime version", runtime))
-
-    if active_run := mlflow.active_run():
-        items.extend([
-            ("Active experiment ID", active_run.info.experiment_id),
-            ("Active run ID", active_run.info.run_id),
-            ("Active run artifact URI", active_run.info.artifact_uri),
-        ])
-
-    mlflow_envs = {
-        k: ("***" if mask_envs else v) for k, v in os.environ.items() if k.startswith("MLFLOW_")
-    }
-    if mlflow_envs:
-        items.append((
-            "MLflow environment variables",
-            yaml.dump({"_": mlflow_envs}, indent=2).replace("'", "").lstrip("_:").rstrip("\n"),
-        ))
-
-    try:
-        requires = importlib_metadata.requires("mlflow")
-    except importlib_metadata.PackageNotFoundError:
-        requires = importlib_metadata.requires("mlflow-skinny")
-
-    mlflow_dependencies = {}
-    for req in requires:
-        req = Requirement(req)
-        try:
-            dist = importlib_metadata.distribution(req.name)
-        except importlib_metadata.PackageNotFoundError:
-            continue
-        else:
-            mlflow_dependencies[req.name] = dist.version
-
-    items.append((
-        "MLflow dependencies",
-        yaml.dump({"_": mlflow_dependencies}, indent=2).replace("'", "").lstrip("_:").rstrip("\n"),
-    ))
-    for key, val in items:
+    for key, val in _get_doctor_info(mask_envs).items():
+        if isinstance(val, dict):
+            val = yaml.dump({"_": val}, indent=2).replace("'", "").lstrip("_:").rstrip("\n")
         click.secho(key, fg="blue", nl=False)
         click.echo(f": {val}")
