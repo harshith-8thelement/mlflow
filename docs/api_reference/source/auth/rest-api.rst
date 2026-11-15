@@ -392,6 +392,63 @@ Response Structure
 
 ===========================
 
+.. _mlflowAuthServiceListPermissionAuditLog:
+
+List Permission Audit Log
+=========================
+
+Admin only. Returns the history of permission grants and revokes, newest first.
+Non-admin callers receive ``403``.
+
++------------------------------------------+-------------+
+|                 Endpoint                 | HTTP Method |
++==========================================+=============+
+| ``2.0/mlflow/permissions/audit-log``     | ``GET``     |
++------------------------------------------+-------------+
+
+.. _mlflowListPermissionAuditLog:
+
+Request Structure
+-----------------
+
++---------------+-------------+-----------------------------------+
+|  Field Name   |    Type     |            Description            |
++===============+=============+===================================+
+| username      | ``STRING``  | Optional. Only return entries     |
+|               |             | whose target user is this user.   |
++---------------+-------------+-----------------------------------+
+| resource_type | ``STRING``  | Optional. Only return entries     |
+|               |             | for this resource type.           |
++---------------+-------------+-----------------------------------+
+| max_results   | ``INTEGER`` | Optional. Maximum number of       |
+|               |             | entries to return. Defaults to    |
+|               |             | 100. Must be between 1 and 1000;  |
+|               |             | other values are rejected with    |
+|               |             | ``INVALID_PARAMETER_VALUE``.      |
++---------------+-------------+-----------------------------------+
+
+.. _mlflowListPermissionAuditLogResponse:
+
+Response Structure
+------------------
+
++------------+------------+-------------------------------------+
+| Field Name |    Type    |             Description             |
++============+============+=====================================+
+| entries    | ``ARRAY``  | Audit log entries, newest first.    |
+|            |            | Each entry has ``id``,              |
+|            |            | ``actor_username``,                 |
+|            |            | ``target_username``,                |
+|            |            | ``resource_type``, ``resource_id``, |
+|            |            | ``old_permission``,                 |
+|            |            | ``new_permission``, ``action``      |
+|            |            | (``create``, ``update`` or          |
+|            |            | ``delete``), ``workspace`` and      |
+|            |            | ``timestamp`` (milliseconds).       |
++------------+------------+-------------------------------------+
+
+===========================
+
 .. _mlflowAuthServiceCreateRole:
 
 Create Role

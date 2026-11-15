@@ -499,6 +499,103 @@ class UserRoleAssignment:
         )
 
 
+class PermissionAuditLogEntry:
+    ACTIONS = ("create", "update", "delete")
+
+    def __init__(
+        self,
+        id: int,
+        actor_username: str,
+        target_username: str,
+        resource_type: str,
+        resource_id: str,
+        old_permission: str | None,
+        new_permission: str | None,
+        action: str,
+        timestamp: int,
+        workspace: str | None = None,
+    ):
+        self._id = id
+        self._actor_username = actor_username
+        self._target_username = target_username
+        self._resource_type = resource_type
+        self._resource_id = resource_id
+        self._old_permission = old_permission
+        self._new_permission = new_permission
+        self._action = action
+        self._timestamp = timestamp
+        self._workspace = workspace
+
+    @property
+    def id(self) -> int:
+        return self._id
+
+    @property
+    def actor_username(self) -> str:
+        return self._actor_username
+
+    @property
+    def target_username(self) -> str:
+        return self._target_username
+
+    @property
+    def resource_type(self) -> str:
+        return self._resource_type
+
+    @property
+    def resource_id(self) -> str:
+        return self._resource_id
+
+    @property
+    def old_permission(self) -> str | None:
+        return self._old_permission
+
+    @property
+    def new_permission(self) -> str | None:
+        return self._new_permission
+
+    @property
+    def action(self) -> str:
+        return self._action
+
+    @property
+    def timestamp(self) -> int:
+        return self._timestamp
+
+    @property
+    def workspace(self) -> str | None:
+        return self._workspace
+
+    def to_json(self) -> dict:
+        return {
+            "id": self.id,
+            "actor_username": self.actor_username,
+            "target_username": self.target_username,
+            "resource_type": self.resource_type,
+            "resource_id": self.resource_id,
+            "old_permission": self.old_permission,
+            "new_permission": self.new_permission,
+            "action": self.action,
+            "workspace": self.workspace,
+            "timestamp": self.timestamp,
+        }
+
+    @classmethod
+    def from_json(cls, dictionary: dict) -> "PermissionAuditLogEntry":
+        return cls(
+            id=dictionary["id"],
+            actor_username=dictionary["actor_username"],
+            target_username=dictionary["target_username"],
+            resource_type=dictionary["resource_type"],
+            resource_id=dictionary["resource_id"],
+            old_permission=dictionary.get("old_permission"),
+            new_permission=dictionary.get("new_permission"),
+            action=dictionary["action"],
+            timestamp=dictionary["timestamp"],
+            workspace=dictionary.get("workspace"),
+        )
+
+
 class GetUserPermissionResult:
     """Response shape for ``GET /mlflow/users/permissions/get``. ``allowed``
     mirrors ``Permission.can_use`` (regular access tier); ``permission`` is the

@@ -18,6 +18,7 @@ from mlflow.protos.databricks_pb2 import (
 )
 from mlflow.server.auth.db import utils as dbutils
 from mlflow.server.auth.db.models import (
+    SqlPermissionAuditLog,
     SqlRole,
     SqlRolePermission,
     SqlUser,
@@ -29,6 +30,7 @@ from mlflow.server.auth.entities import (
     GatewayModelDefinitionPermission,
     GatewaySecretPermission,
     MCPServerPermission,
+    PermissionAuditLogEntry,
     RegisteredModelPermission,
     Role,
     RolePermission,
@@ -66,6 +68,7 @@ from mlflow.store.db.utils import (
     create_sqlalchemy_engine_with_retry,
 )
 from mlflow.utils import workspace_context
+from mlflow.utils.time import get_current_time_millis
 from mlflow.utils.uri import extract_db_type_from_uri
 from mlflow.utils.validation import (
     MAX_ROLE_DESCRIPTION_LENGTH,
@@ -533,10 +536,13 @@ class SqlAlchemyStore:
         resource_type: str,
         resource_pattern: str,
         permission: str,
+        *,
+        acting_username: str | None = None,
     ) -> None:
         """Insert one grant on ``username``'s synthetic role in the active workspace;
         raises ``RESOURCE_ALREADY_EXISTS`` if a row exists (matches the legacy
-        ``create_*_permission`` contract).
+        ``create_*_permission`` contract). When ``acting_username`` is set, a ``create``
+        audit row is written in the same transaction.
         """
         self._reject_workspace_resource_type(resource_type)
         _validate_resource_pattern(resource_pattern, resource_type)
@@ -577,16 +583,33 @@ class SqlAlchemyStore:
                 # Concurrent create lost the unique-constraint race. Surface as
                 # a clean RESOURCE_ALREADY_EXISTS instead of a 500.
                 raise MlflowException(duplicate_message, RESOURCE_ALREADY_EXISTS) from e
+            if acting_username is not None:
+                session.add(
+                    SqlPermissionAuditLog(
+                        action="create",
+                        actor_username=acting_username,
+                        target_username=username,
+                        resource_type=resource_type,
+                        resource_id=resource_pattern,
+                        old_permission=None,
+                        new_permission=permission,
+                        workspace=workspace_name,
+                        timestamp=get_current_time_millis(),
+                    )
+                )
 
     def revoke_user_resource_permission(
         self,
         username: str,
         resource_type: str,
         resource_pattern: str,
+        *,
+        acting_username: str | None = None,
     ) -> None:
         """Remove one grant from ``username``'s synthetic role in the active workspace;
         raises ``RESOURCE_DOES_NOT_EXIST`` if no row matches (matches the legacy
-        ``delete_*_permission`` contract).
+        ``delete_*_permission`` contract). When ``acting_username`` is set, a ``delete``
+        audit row is written in the same transaction.
         """
         self._reject_workspace_resource_type(resource_type)
         _validate_resource_type(resource_type)
@@ -621,7 +644,42 @@ class SqlAlchemyStore:
             )
             if rp is None:
                 raise MlflowException(not_found_message, RESOURCE_DOES_NOT_EXIST)
+            old_permission = rp.permission
             session.delete(rp)
+            if acting_username is not None:
+                session.add(
+                    SqlPermissionAuditLog(
+                        action="delete",
+                        actor_username=acting_username,
+                        target_username=username,
+                        resource_type=resource_type,
+                        resource_id=resource_pattern,
+                        old_permission=old_permission,
+                        new_permission=None,
+                        workspace=workspace_name,
+                        timestamp=get_current_time_millis(),
+                    )
+                )
+
+    def list_permission_audit_log(
+        self,
+        username: str | None = None,
+        resource_type: str | None = None,
+        max_results: int = 100,
+    ) -> list[PermissionAuditLogEntry]:
+        with self.ManagedSessionMaker(read_only=True) as session:
+            query = session.query(SqlPermissionAuditLog)
+            if username is not None:
+                query = query.filter(SqlPermissionAuditLog.target_username == username)
+            if resource_type is not None:
+                query = query.filter(SqlPermissionAuditLog.resource_type == resource_type)
+            rows = (
+                query
+                .order_by(SqlPermissionAuditLog.timestamp.desc(), SqlPermissionAuditLog.id.desc())
+                .limit(max_results)
+                .all()
+            )
+            return [row.to_mlflow_entity() for row in rows]
 
     def delete_grants_for_resource(
         self,
