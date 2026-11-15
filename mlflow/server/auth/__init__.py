@@ -357,6 +357,7 @@ from mlflow.server.auth.routes import (
     AJAX_GET_USER_PERMISSION,
     AJAX_GRANT_USER_PERMISSION,
     AJAX_LIST_CURRENT_USER_PERMISSIONS,
+    AJAX_LIST_PERMISSION_AUDIT_LOG,
     AJAX_LIST_ROLE_PERMISSIONS,
     AJAX_LIST_ROLE_USERS,
     AJAX_LIST_ROLES,
@@ -405,6 +406,7 @@ from mlflow.server.auth.routes import (
     JOB_CANCEL,
     JOB_GET,
     LIST_CURRENT_USER_PERMISSIONS,
+    LIST_PERMISSION_AUDIT_LOG,
     LIST_ROLE_PERMISSIONS,
     LIST_ROLE_USERS,
     LIST_ROLES,
@@ -3913,6 +3915,11 @@ def validate_can_delete_user():
     return False
 
 
+def validate_can_read_permission_audit_log():
+    # only admins can read the audit log, but admins won't reach this validator
+    return False
+
+
 def validate_can_read_gateway_secret():
     msg = _get_request_message(GetGatewaySecretInfo())
     return _get_gateway_secret_permission(msg.secret_id).can_read
@@ -5561,6 +5568,9 @@ BEFORE_REQUEST_VALIDATORS.update({
     (AJAX_REVOKE_USER_PERMISSION, "POST"): validate_can_manage_resource,
     (GET_USER_PERMISSION, "GET"): validate_can_get_user_permission,
     (AJAX_GET_USER_PERMISSION, "GET"): validate_can_get_user_permission,
+    # Admin-only: the audit log exposes who changed whose permissions.
+    (LIST_PERMISSION_AUDIT_LOG, "GET"): validate_can_read_permission_audit_log,
+    (AJAX_LIST_PERMISSION_AUDIT_LOG, "GET"): validate_can_read_permission_audit_log,
 })
 
 # Flask routes (no proto mapping)
@@ -8304,6 +8314,14 @@ def delete_user():
 # =============================================================================
 
 
+_PERMISSION_AUDIT_LOG_DEFAULT_MAX_RESULTS = 100
+_PERMISSION_AUDIT_LOG_MAX_RESULTS_LIMIT = 1000
+
+
+def _get_acting_username() -> str:
+    return getattr(g, "mlflow_authenticated_user", None) or authenticate_request().username
+
+
 # Workspace rejection + resource_type / permission validation live on the store
 # layer (sqlalchemy_store.grant/revoke_user_resource_permission); the handlers
 # defer so both paths share one source of truth.
@@ -8316,7 +8334,13 @@ def grant_user_permission():
     resource_id = _get_request_param("resource_id")
     permission = _get_request_param("permission")
     store.get_user(username)
-    store.grant_user_resource_permission(username, resource_type, resource_id, permission)
+    store.grant_user_resource_permission(
+        username,
+        resource_type,
+        resource_id,
+        permission,
+        acting_username=_get_acting_username(),
+    )
     return make_response({})
 
 
@@ -8326,8 +8350,30 @@ def revoke_user_permission():
     resource_type = _get_request_param("resource_type")
     resource_id = _get_request_param("resource_id")
     store.get_user(username)
-    store.revoke_user_resource_permission(username, resource_type, resource_id)
+    store.revoke_user_resource_permission(
+        username, resource_type, resource_id, acting_username=_get_acting_username()
+    )
     return make_response({})
+
+
+@catch_mlflow_exception
+def list_permission_audit_log():
+    username = request.args.get("username")
+    resource_type = request.args.get("resource_type")
+    raw_max_results = request.args.get("max_results")
+    if raw_max_results is None:
+        max_results = _PERMISSION_AUDIT_LOG_DEFAULT_MAX_RESULTS
+    else:
+        max_results = _coerce_int_param("max_results", raw_max_results)
+        if not 1 <= max_results <= _PERMISSION_AUDIT_LOG_MAX_RESULTS_LIMIT:
+            raise MlflowException.invalid_parameter_value(
+                f"Parameter 'max_results' must be between 1 and "
+                f"{_PERMISSION_AUDIT_LOG_MAX_RESULTS_LIMIT}. Got: {max_results}"
+            )
+    entries = store.list_permission_audit_log(
+        username=username, resource_type=resource_type, max_results=max_results
+    )
+    return make_response({"entries": [e.to_json() for e in entries]})
 
 
 @catch_mlflow_exception
@@ -10018,6 +10064,13 @@ _RBAC_ROUTES: list[tuple[Callable[[], Any], str, str, str]] = [
     (grant_user_permission, "POST", GRANT_USER_PERMISSION, AJAX_GRANT_USER_PERMISSION),
     (revoke_user_permission, "POST", REVOKE_USER_PERMISSION, AJAX_REVOKE_USER_PERMISSION),
     (get_user_permission, "GET", GET_USER_PERMISSION, AJAX_GET_USER_PERMISSION),
+    # Admin-only read of the permission grant/revoke audit log.
+    (
+        list_permission_audit_log,
+        "GET",
+        LIST_PERMISSION_AUDIT_LOG,
+        AJAX_LIST_PERMISSION_AUDIT_LOG,
+    ),
 ]
 
 

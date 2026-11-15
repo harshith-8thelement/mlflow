@@ -36,6 +36,7 @@ def test_upgrade(tmp_path: Path) -> None:
         ("gateway_endpoint_permissions",),
         ("gateway_model_definition_permissions",),
         ("workspace_permissions",),
+        ("permission_audit_log",),
     ])
 
 
@@ -145,7 +146,7 @@ def test_upgrade_from_legacy_database(tmp_path: Path) -> None:
     assert "scorer_permissions" in tables
     assert "registered_model_permissions" in tables
     assert "workspace_permissions" in tables
-    assert version[0] == "f1a2b3c4d5e6"
+    assert version[0] == "a9b8c7d6e5f4"
     assert user == ("testuser", 1)
 
 
@@ -754,3 +755,53 @@ def test_promote_prompt_resource_type_downgrade_collapses_to_registered_model(
         cursor.execute("SELECT resource_type, resource_pattern FROM role_permissions")
         rows = cursor.fetchall()
     assert rows == [("registered_model", "prompt-foo")]
+
+
+def test_permission_audit_log_migration_upgrade_downgrade_upgrade(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db = tmp_path / "test.db"
+    db_url = f"sqlite:///{db}"
+
+    res = runner.invoke(cli.upgrade, ["--url", db_url], catch_exceptions=False)
+    assert res.exit_code == 0, res.output
+
+    def _table_and_indexes() -> tuple[bool, set[str]]:
+        with sqlite3.connect(db) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+            tables = {t[0] for t in cursor.fetchall()}
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='index';")
+            indexes = {i[0] for i in cursor.fetchall()}
+        return "permission_audit_log" in tables, indexes
+
+    exists, indexes = _table_and_indexes()
+    assert exists
+    assert "idx_permission_audit_log_target_ts" in indexes
+    assert "idx_permission_audit_log_resource_type" in indexes
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO permission_audit_log "
+            "(actor_username, target_username, resource_type, resource_id, "
+            "old_permission, new_permission, action, timestamp) "
+            "VALUES ('admin', 'alice', 'experiment', '1', NULL, 'READ', 'create', 1700000000000)"
+        )
+        conn.commit()
+
+    _alembic_downgrade(db_url, "f1a2b3c4d5e6")
+
+    exists, indexes = _table_and_indexes()
+    assert not exists
+    assert "idx_permission_audit_log_target_ts" not in indexes
+    assert "idx_permission_audit_log_resource_type" not in indexes
+    with sqlite3.connect(db) as conn:
+        version = conn.execute("SELECT version_num FROM alembic_version_auth").fetchone()
+    assert version == ("f1a2b3c4d5e6",)
+
+    res = runner.invoke(cli.upgrade, ["--url", db_url], catch_exceptions=False)
+    assert res.exit_code == 0, res.output
+
+    exists, indexes = _table_and_indexes()
+    assert exists
+    assert "idx_permission_audit_log_target_ts" in indexes
+    assert "idx_permission_audit_log_resource_type" in indexes

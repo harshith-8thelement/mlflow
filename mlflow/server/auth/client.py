@@ -1,5 +1,6 @@
 from mlflow.server.auth.entities import (
     GetUserPermissionResult,
+    PermissionAuditLogEntry,
     Role,
     RolePermission,
     User,
@@ -16,6 +17,7 @@ from mlflow.server.auth.routes import (
     GET_USER,
     GET_USER_PERMISSION,
     GRANT_USER_PERMISSION,
+    LIST_PERMISSION_AUDIT_LOG,
     LIST_ROLE_PERMISSIONS,
     LIST_ROLE_USERS,
     LIST_ROLES,
@@ -414,3 +416,33 @@ class AuthServiceClient:
             },
         )
         return GetUserPermissionResult.from_json(resp)
+
+    def list_permission_audit_log(
+        self,
+        username: str | None = None,
+        resource_type: str | None = None,
+        max_results: int | None = None,
+    ) -> list[PermissionAuditLogEntry]:
+        """
+        List permission grant/revoke audit log entries, newest first. Admin only.
+
+        Args:
+            username: Only return entries whose target user is this user.
+            resource_type: Only return entries for this resource type.
+            max_results: Maximum number of entries to return. The server defaults to 100
+                and rejects values above 1000.
+
+        Returns:
+            A list of :py:class:`mlflow.server.auth.entities.PermissionAuditLogEntry`.
+        """
+        params = {
+            key: value
+            for key, value in {
+                "username": username,
+                "resource_type": resource_type,
+                "max_results": max_results,
+            }.items()
+            if value is not None
+        }
+        resp = self._request(LIST_PERMISSION_AUDIT_LOG, "GET", params=params)
+        return [PermissionAuditLogEntry.from_json(e) for e in resp.get("entries", [])]

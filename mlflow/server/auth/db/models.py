@@ -1,4 +1,5 @@
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Column,
     ForeignKey,
@@ -10,6 +11,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import declarative_base, relationship
 
 from mlflow.server.auth.entities import (
+    PermissionAuditLogEntry,
     Role,
     RolePermission,
     User,
@@ -116,4 +118,37 @@ class SqlUserRoleAssignment(Base):
             id_=self.id,
             user_id=self.user_id,
             role_id=self.role_id,
+        )
+
+
+class SqlPermissionAuditLog(Base):
+    __tablename__ = "permission_audit_log"
+
+    id = Column(Integer(), primary_key=True, autoincrement=True)
+    actor_username = Column(String(255), nullable=False)
+    target_username = Column(String(255), nullable=False)
+    resource_type = Column(String(64), nullable=False)
+    resource_id = Column(String(255), nullable=False)
+    old_permission = Column(String(255), nullable=True)
+    new_permission = Column(String(255), nullable=True)
+    action = Column(String(16), nullable=False)
+    workspace = Column(String(255), nullable=True)
+    timestamp = Column(BigInteger, nullable=False)
+    __table_args__ = (
+        Index("idx_permission_audit_log_target_ts", "target_username", "timestamp"),
+        Index("idx_permission_audit_log_resource_type", "resource_type"),
+    )
+
+    def to_mlflow_entity(self) -> PermissionAuditLogEntry:
+        return PermissionAuditLogEntry(
+            id=self.id,
+            actor_username=self.actor_username,
+            target_username=self.target_username,
+            resource_type=self.resource_type,
+            resource_id=self.resource_id,
+            old_permission=self.old_permission,
+            new_permission=self.new_permission,
+            action=self.action,
+            timestamp=self.timestamp,
+            workspace=self.workspace,
         )

@@ -26,6 +26,8 @@ REVOKE_USER_PERMISSION = _get_rest_path("/mlflow/users/permissions/revoke", vers
 AJAX_REVOKE_USER_PERMISSION = _get_ajax_path("/mlflow/users/permissions/revoke", version=3)
 GET_USER_PERMISSION = _get_rest_path("/mlflow/users/permissions/get", version=3)
 AJAX_GET_USER_PERMISSION = _get_ajax_path("/mlflow/users/permissions/get", version=3)
+LIST_PERMISSION_AUDIT_LOG = _get_rest_path("/mlflow/permissions/audit-log")
+AJAX_LIST_PERMISSION_AUDIT_LOG = _get_ajax_path("/mlflow/permissions/audit-log")
 UPDATE_USER_PASSWORD = _get_rest_path("/mlflow/users/update-password")
 AJAX_UPDATE_USER_PASSWORD = _get_ajax_path("/mlflow/users/update-password")
 UPDATE_USER_ADMIN = _get_rest_path("/mlflow/users/update-admin")
