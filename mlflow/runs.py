@@ -40,7 +40,7 @@ def commands():
     "--view",
     "-v",
     default="active_only",
-    help="Select view type for list experiments. Valid view types are "
+    help="Select view type for list runs. Valid view types are "
     "'active_only' (default), 'deleted_only', and 'all'.",
 )
 def list_run(experiment_id: str, view: str) -> None:
